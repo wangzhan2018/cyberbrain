@@ -5,12 +5,13 @@ CyberBrain Controller: 大脑主接口
 用于测试和集成调用
 """
 import logging
-from typing import Optional
+from typing import List, Optional
 
-from fastapi import APIRouter, Body
+from fastapi import APIRouter, Body, Query
 from pydantic import BaseModel, Field
 
 from app.service.cyber_brain import cyber_brain
+from app.service.outreach_service import outreach_service
 
 logger = logging.getLogger(__name__)
 
@@ -71,3 +72,28 @@ async def react(request: ReactRequest = Body(...)):
 
     return result
 
+
+
+class TalkMessage(BaseModel):
+    """agent 主动想对某人说的一句话"""
+    id: str
+    agent_id: str
+    to: str = Field(..., description="说给谁（关系表里的人名）")
+    content: str = Field(..., description="说出口的话")
+    source: str = Field(..., description="来源：task（任务完成的通知）/ thought（想说出口的念头）")
+    ref: Optional[str] = Field(None, description="关联的任务 id 或念头原文")
+    created_at: str
+
+
+@router.get("/fetch_talk", response_model=List[TalkMessage], summary="取走 agent 想对某人说的话")
+async def fetch_talk(
+    agent_id: str = Query(..., description="Agent ID"),
+    human: str = Query(..., description="人类的角色名（与关系表里的人名一致，如'史塔克'）"),
+):
+    """
+    agent 主动想对这个人说的话（任务完成后的通知、想说出口的念头），按时间先后返回。
+    **取走即从发件箱删除**，同一条消息只会返回一次；没有消息时返回空列表。
+
+    只有关系表里 kind=human 的人才会有消息：对 agent 的主动联系直接调用对方的 react，不经过发件箱。
+    """
+    return await outreach_service.fetch_talk(agent_id, human)

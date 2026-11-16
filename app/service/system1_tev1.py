@@ -70,6 +70,7 @@ QUICK_ACTIONS = {
     "简单回答": "知道就直接说，不知道就说不知道",
     "岔开话题": "不想接这个茬，换个话题",
     "愣住或追问": "没反应过来，或者问对方啥意思、为什么这么说",  # 🔥 新增
+    "凭印象说": "没有确切依据，凭模糊的印象和感觉说一说",
     "得想一想": "这事不能凭直觉，得先想清楚怎么回",  # THINK_ACTION
 }
 
@@ -88,6 +89,7 @@ class System1Tev1:
         speaker_info: str = "",  # 🔥 说话人信息
         situation_context: str = "",  # 🔥 主体性上下文（overall_state + situation）
         recent_dialogue: str = "",  # 最近几条对话原文（不含本句）
+        knowledge_hint: str = "",  # 我对这个话题掌握的资料（只有标题），或"没有相关资料"
     ) -> Dict[str, Any]:
         """
         分析外部信号的情绪反应
@@ -100,6 +102,8 @@ class System1Tev1:
             situation_context: 主体性上下文（overall_state + situation，可选）
             recent_dialogue: 最近几条对话（不含本句）。"需要""好的""不用了"这类回答的意思全在上一句，
                 没有它 System1 只能对着孤立的两个字猜
+            knowledge_hint: 我对这个话题掌握什么资料。知道自己知道什么、不知道什么是元认知；
+                不知道时直说、含糊带过还是岔开话题，由人格决定，所以要在直觉这一步就让它看到
 
         Returns:
             {
@@ -124,6 +128,8 @@ class System1Tev1:
 
             context += f"【我的人格画像】\n{persona}\n\n" if persona else ""
             context += f"【我的信条与事实】\n{brief}\n\n"
+            if knowledge_hint:
+                context += f"【我对这个话题掌握的资料】\n{knowledge_hint}\n\n"
             # 刚才的对话紧挨在信号前：省略回答要结合上一句才能理解（小模型对紧邻信号的内容权重更高）
             if recent_dialogue:
                 context += f"【刚才的对话】（按时间先后，越靠后越新）\n{recent_dialogue}\n\n"
@@ -230,7 +236,8 @@ class System1Tev1:
                     "quick_action": {
                         "type": "choice",
                         "instructions": "不经过思考，凭我的性格和我跟对方的关系，第一反应会怎么接这句话？"
-                                        "拿不准、需要先想想的，选'得想一想'。",
+                                        "对方问到我不掌握的东西时，按我的性格自然反应：有人直说不知道，有人凭印象说，"
+                                        "有人岔开话题或反问。拿不准、需要先想想的，选'得想一想'。",
                         "criteria": QUICK_ACTIONS,
                     },
                     "needs_memory": {

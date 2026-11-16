@@ -49,6 +49,15 @@ class Settings(BaseSettings):
     DOUBAO_MODEL_LITE: str = "doubao-seed-2-1-lite-260915"
     DOUBAO_MODEL_CHARACTER: str = "doubao-seed-character-260628"
 
+    # 联网搜索（Tavily，未配置 key 时不联网，需要联网的待办保持待执行）
+    TAVILY_API_KEY: str = ""
+    WEB_SEARCH_MAX_RESULTS: int = 5  # 每次搜索取的结果条数
+    WEB_SEARCH_TIMEOUT: int = 30  # 搜索超时（秒）
+    # 优先搜索的站点（逗号分隔，空表示不限）。prefer 模式：优先返回这些站点，不够时仍会补充其他站点
+    WEB_SEARCH_PREFER_DOMAINS: str = ""
+    WEB_KNOWLEDGE_MAX_CHARS: int = 400  # 联网整理时每条知识正文的字数上限（写在提示词里，不截断）
+    WEB_KNOWLEDGE_MAX_ITEMS: int = 3  # 每个联网待办最多整理出几条知识
+
     # Brief稠密检索阈值
     BRIEF_DENSE_SCORE_THRESHOLD: float = 0.3
 
@@ -83,7 +92,8 @@ class Settings(BaseSettings):
     # 赛博大脑 react
     BRAIN_BRIEF_TOP_K: int = 10  # System1参考的信条/事实条数
     BRAIN_EPISODIC_TOP_K: int = 5  # System2参考的情景记忆条数
-    BRAIN_KNOWLEDGE_SCORE_THRESHOLD: float = 0.5  # 预取知识相似度≥此值时直接使用，不依赖System1判断
+    BRAIN_KNOWLEDGE_SCORE_THRESHOLD: float = 0.5  # 知识向量召回的余弦下限（粗筛，候选再交给rerank判断是否相关）
+    BRAIN_KNOWLEDGE_RERANK_MIN_SCORE: float = 0.5  # 知识rerank相关性≥此值才使用；全部低于此值视为"库里没有"
     BRAIN_KNOWLEDGE_INJECT_TOP_K: int = 2  # 注入System2的知识条数（知识内容长，多了稀释注意力）
     BRAIN_KNOWLEDGE_CONTENT_CHARS: int = 1200  # 每条知识注入的最大字符数
     BRAIN_SYSTEM2_TEMPERATURE: float = 0.3  # 实测0.7时编造率显著更高，编造内容会写入PFC并被巩固成长期记忆
@@ -93,6 +103,9 @@ class Settings(BaseSettings):
     # 路由：System1的noul/choice概率 -> 走哪条认知路径（阈值需用探针标定）
     BRAIN_ROUTE_REASONING_THRESHOLD: float = 0.6  # needs_reasoning ≥ 此值 -> System2
     BRAIN_ROUTE_MEMORY_THRESHOLD: float = 0.6  # needs_memory ≥ 此值 -> 带回忆
+    # 并行召回的 Episodic 里，rerank 分数最高的一条 ≥ 此值 -> 带回忆（被对方的话勾起了往事）。
+    # 实测需要回想的句子 0.81–0.98，不需要的 0–0.66
+    BRAIN_EPISODIC_CUE_MIN_SCORE: float = 0.75
     BRAIN_ROUTE_THINK_THRESHOLD: float = 0.5  # 直觉行为里"得想一想"的概率 ≥ 此值 -> System2
     BRAIN_ROUTE_MIN_ACTION_CONFIDENCE: float = 0.55  # 直觉行为置信度低于此值时不走fast（拿不准就交给System2）
     BRAIN_ROUTE_HOSTILE_MAX_CONFLICT: float = 0.4  # 对熟人选了拒绝/顶回去，但冲突程度低于此值时，交给System2复核
@@ -106,6 +119,13 @@ class Settings(BaseSettings):
     DECAY_WORKER_INTERVAL: int = 86400  # 24小时
     THOUGHT_GENERATOR_INTERVAL: int = 3600  # 念头生成间隔（秒），默认1小时
     TASK_REMINDER_INTERVAL: int = 3600  # 待办任务检查间隔（秒），默认1小时
+
+    # 反思：每天把被重新提起的经历沉淀成信念（Brief 只由这里写入）
+    REFLECTION_WORKER_RUN_HOUR: int = 4  # 每天几点跑（本地时间，24 小时制）
+    REFLECTION_MAX_CANDIDATES: int = 30  # 每个 agent 每轮最多看多少条经历
+    REFLECTION_MAX_ACTIONS: int = 2  # 每轮最多写入/修正几条信念（有界步长）
+    REFLECTION_MIN_CONFIDENCE: float = 0.75  # 低于此置信度一律不写
+    REFLECTION_INCLUDE_HIGH_IMPORTANCE: bool = True  # 高重要度经历（importance ≥ 3）是否也纳入候选
 
     @field_validator("MEM0_BRIEF_HISTORY_DB", "MEM0_EPISODIC_HISTORY_DB")
     @classmethod

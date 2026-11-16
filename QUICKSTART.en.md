@@ -38,6 +38,7 @@ No keys need to be created in advance; all data is written per agent at runtime.
 | `persona:{agent_id}:system1` / `:system2` / `:speaking_manner` | String | The three parts of the persona |
 | `subject_context:{agent_id}` | String (JSON, expires after 30 days) | Situation, overall state, thoughts, to-dos |
 | `agent:{agent_id}:relationships` | Hash | Relationships |
+| `agent:{agent_id}:capabilities` | Set | Capabilities (e.g. `web_search`); empty unless enabled |
 | `wm:{agent_id}:stm` / `wm:{agent_id}:stm:compress` | List | Working memory raw records / compressed summaries (the braces around `{agent_id}` are literal; they act as a Redis Cluster hash tag) |
 
 ## MongoDB

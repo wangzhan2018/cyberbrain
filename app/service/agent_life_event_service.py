@@ -21,6 +21,7 @@ class AgentLifeEventService:
     EVENT_TYPE_MEMORY = "memory"                # 记忆写入
     EVENT_TYPE_EMOTION = "emotion"              # 情绪变化
     EVENT_TYPE_TASK_EXEC = "task_execution"     # 任务执行
+    EVENT_TYPE_PROACTIVE = "proactive_talk"     # 主动对某人说的话
 
     async def record_react_input(
         self,
@@ -82,6 +83,14 @@ class AgentLifeEventService:
             metadata=metadata,
             rt=rt,
             trace=trace,
+        )
+
+    async def record_proactive_talk(self, agent_id: str, message: Dict[str, Any]) -> Optional[str]:
+        """记录主动对某人说的话（任务完成的通知、想说出口的念头），含投递方式（outbox / react）"""
+        return await agent_life_event_repository.insert_event(
+            agent_id=agent_id,
+            event_type=self.EVENT_TYPE_PROACTIVE,
+            data=message,
         )
 
     async def record_thought(

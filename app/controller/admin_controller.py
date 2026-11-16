@@ -16,15 +16,16 @@ import asyncio
 import logging
 import uuid
 from datetime import datetime
-from typing import List, Optional, Dict, Any
+from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, Body, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from app.common.response import APIResponse
 from app.config.runtime_config import RuntimeConfigError, list_runtime_configs, update_runtime_configs
 from app.repository.memory_repository import memory_repository
 from app.repository.relationship_repository import relationship_repository
+from app.repository.capability_repository import capability_repository, capabilities_key
 from app.service.persona_manager import persona_manager
 from app.service.knowledge_memory_service import knowledge_memory_service
 from app.service.subjectivity_service import subjectivity_service
@@ -71,9 +72,21 @@ class KnowledgeMemory(BaseModel):
 
 class Relationship(BaseModel):
     """人际关系数据结构"""
-    person_name: str = Field(..., description="人名")
+    person_name: str = Field(..., description="人名（对方在我这里的称呼，也是对话时 speaker 的名字）")
     relationship: str = Field(..., description="关系类型，如'同事'/'上级'/'朋友'/'家人'")
     description: str = Field(default="", description="关系描述，如'关系一般，比较严格'")
+    kind: Literal["human", "agent"] = Field(
+        default="human", description="对方是真人（human）还是另一个 agent（agent）。决定主动联系的方式："
+                                     "human 写入发件箱由 fetch_talk 取走，agent 调用对方的 react")
+    agent_id: Optional[str] = Field(default=None, description="kind=agent 时对方的 agent_id，必填；kind=human 时不能填")
+
+    @model_validator(mode="after")
+    def _check_kind(self):
+        if self.kind == "agent" and not (self.agent_id or "").strip():
+            raise ValueError(f"关系「{self.person_name}」的 kind=agent，必须提供 agent_id")
+        if self.kind == "human" and self.agent_id:
+            raise ValueError(f"关系「{self.person_name}」的 kind=human，不能提供 agent_id")
+        return self
 
 
 class SituationInit(BaseModel):
@@ -106,6 +119,7 @@ class PendingTaskInit(BaseModel):
     deadline: Optional[str] = Field(default=None, description="截止时间 YYYY-MM-DD")
     related_person: Optional[str] = Field(default=None, description="相关人员")
     interaction_type: Optional[str] = Field(default=None, description="交互类型")
+    needs_web_search: bool = Field(default=False, description="执行时是否需要联网搜索补充信息")
     status: str = Field(default="pending", description="状态：只有 pending 会写入；其他值（如 completed）会被忽略")
 
 
@@ -123,6 +137,7 @@ class InitializeAgentRequest(BaseModel):
     persona_system1: Optional[str] = Field(default=None, description="System1人格画像（情绪参数）")
     persona_system2: Optional[str] = Field(default=None, description="System2人格画像（认知与表达参数）")
     speaking_manner: Optional[str] = Field(default=None, description="说话习惯（用词、句式、语气）")
+    capabilities: List[Literal["web_search"]] = Field(default_factory=list, description="能力列表（覆盖式），目前只有 web_search：对话 / 念头里的待办会判断要不要联网，联网任务可以立即执行。不传或为空表示没有任何能力，拟人角色（真实的人类）不应开启")
 
 
 @router.get("/agents", response_model=APIResponse[List[str]])
@@ -166,6 +181,7 @@ def _build_pending_tasks(tasks: List["PendingTaskInit"]) -> List[Dict[str, Any]]
             "deadline": task.deadline,
             "related_person": task.related_person,
             "interaction_type": task.interaction_type,
+            "needs_web_search": task.needs_web_search,
             "created_at": now,
             "status": "pending",
         })
@@ -184,6 +200,7 @@ async def _agent_exists(agent_id: str) -> Optional[str]:
         "persona": [f"{persona}:system1", f"{persona}:system2", f"{persona}:speaking_manner"],
         "subject_context": [f"{subjectivity_service.redis_key_prefix}:{agent_id}"],
         "relationships": [f"agent:{agent_id}:relationships"],
+        "capabilities": [capabilities_key(agent_id)],
     }
     for source, keys in redis_keys.items():
         if await redis_client.client.exists(*keys):
@@ -303,6 +320,10 @@ async def _initialize_agent(request: InitializeAgentRequest):
                 request.speaking_manner
             )
 
+        # 能力（如联网搜索）：只有显式开启的 agent 才有
+        if request.capabilities:
+            await capability_repository.set(agent_id, list(dict.fromkeys(request.capabilities)))
+
         brief_success = 0
         episodic_success = 0
         knowledge_success = 0
@@ -324,6 +345,8 @@ async def _initialize_agent(request: InitializeAgentRequest):
                     person_name=rel.person_name,
                     relationship=rel.relationship,
                     description=rel.description,
+                    kind=rel.kind,
+                    target_agent_id=rel.agent_id,
                 )
                 relationship_success += 1
             except Exception as e:
@@ -393,6 +416,7 @@ async def _initialize_agent(request: InitializeAgentRequest):
 
         result = {
             "agent_id": agent_id,
+            "capabilities": await capability_repository.get(agent_id),
             "brief": {
                 "total": brief_count,
                 "success": brief_success,
@@ -487,7 +511,8 @@ async def get_agent_info(agent_id: str):
 
     返回：
     - persona: {system1, system2, speaking_manner}
-    - relationships: [{person_name, relationship, description}]
+    - capabilities: ["web_search", ...]（未开启时为空列表）
+    - relationships: [{person_name, relationship, description, kind, agent_id}]
     - situation: {current_activity, time_sensitive_events, ongoing_states, attention_focus}
     - overall_state: {mood, stress, energy}
     - thoughts: [{content, trigger, intensity}]
@@ -500,6 +525,7 @@ async def get_agent_info(agent_id: str):
         result = {
             "agent_id": agent_id,
             "persona": {},
+            "capabilities": [],
             "relationships": [],
             "situation": None,
             "overall_state": None,
@@ -521,19 +547,20 @@ async def get_agent_info(agent_id: str):
         except Exception as e:
             logger.warning(f"Failed to get persona for {agent_id}: {e}")
 
+        try:
+            result["capabilities"] = await capability_repository.get(agent_id)
+        except Exception as e:
+            logger.warning(f"Failed to get capabilities for {agent_id}: {e}")
+
         # 2. 获取 Relationships
         try:
-            relationships_dict = await relationship_repository.load_all_relationships(agent_id)
-            for person_name, relation_desc in relationships_dict.items():
-                # relation_desc 格式: "关系类型，描述"
-                parts = relation_desc.split("，", 1)
-                relationship = parts[0] if parts else relation_desc
-                description = parts[1] if len(parts) > 1 else ""
-
+            for person_name, rel in (await relationship_repository.load_all(agent_id)).items():
                 result["relationships"].append({
                     "person_name": person_name,
-                    "relationship": relationship,
-                    "description": description
+                    "relationship": rel["relationship"],
+                    "description": rel["description"],
+                    "kind": rel["kind"],
+                    "agent_id": rel["agent_id"],
                 })
         except Exception as e:
             logger.warning(f"Failed to get relationships for {agent_id}: {e}")
@@ -579,6 +606,7 @@ async def get_agent_info(agent_id: str):
                             "deadline": task.get("deadline"),
                             "related_person": task.get("related_person"),
                             "interaction_type": task.get("interaction_type"),
+                            "needs_web_search": task.get("needs_web_search", False),
                             "status": task.get("status", "pending")
                         })
         except Exception as e:
@@ -644,6 +672,8 @@ class UpdateAgentRequest(BaseModel):
     thoughts: Optional[List[ThoughtInit]] = Field(default=None, description="念头列表（覆盖现有）")
     pending_tasks: Optional[List[PendingTaskInit]] = Field(default=None, description="待办任务列表（覆盖现有）")
     relationships: Optional[List[Relationship]] = Field(default=None, description="人际关系列表（覆盖现有）")
+    capabilities: Optional[List[Literal["web_search"]]] = Field(
+        default=None, description="能力列表（覆盖现有，传 [] 清空），目前只有 web_search")
 
 
 @router.put("/agent/{agent_id}", response_model=APIResponse[dict])
@@ -658,6 +688,7 @@ async def update_agent(agent_id: str, request: UpdateAgentRequest):
     - thoughts: 覆盖整个thoughts列表
     - pending_tasks: 覆盖整个pending_tasks列表
     - relationships: 覆盖所有关系（先清空再添加）
+    - capabilities: 覆盖能力列表（传 [] 清空）
 
     注意：system3对应的是speaking_manner字段
     """
@@ -758,11 +789,18 @@ async def update_agent(agent_id: str, request: UpdateAgentRequest):
                     agent_id=agent_id,
                     person_name=rel.person_name,
                     relationship=rel.relationship,
-                    description=rel.description
+                    description=rel.description,
+                    kind=rel.kind,
+                    target_agent_id=rel.agent_id,
                 )
 
             updated_fields.append("relationships")
             logger.info(f"Updated {len(request.relationships)} relationships for {agent_id}")
+
+        if request.capabilities is not None:
+            await capability_repository.set(agent_id, list(dict.fromkeys(request.capabilities)))
+            updated_fields.append("capabilities")
+            logger.info(f"Updated capabilities for {agent_id}: {request.capabilities}")
 
         result = {
             "agent_id": agent_id,

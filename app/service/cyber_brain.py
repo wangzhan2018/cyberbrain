@@ -20,12 +20,17 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from app.client.doubao_client import doubao_client, start_usage_collection
 from app.client.embedding_client import embedding_client
+from app.client.rerank_client import rerank_client
 from app.config.prompts import (
     SYSTEM2_PROMPT, SYSTEM2_USER_TEMPLATE, SYSTEM3_PROMPT, SYSTEM3_USER_TEMPLATE,
 )
 from app.config.settings import settings
 from app.repository.memory_repository import memory_repository
-from app.repository.relationship_repository import relationship_repository
+from app.repository.relationship_repository import (
+    describe as describe_relationship,
+    format_profile,
+    relationship_repository,
+)
 from app.service.memory_gate_service import memory_gate_service
 from app.service.subjectivity_service import subjectivity_service
 from app.service.persona_manager import persona_manager
@@ -84,9 +89,25 @@ def _format_memories(memories: List[Dict[str, Any]], empty: str) -> str:
     return "\n".join(lines) if lines else empty
 
 
+def _confidence_label(confidence: Optional[float]) -> str:
+    """知识可信度的文字版（不给数值，数字会被模型当成要'体现'的指标）"""
+    if confidence is None:
+        return "可信度未知"
+    if confidence >= 0.75:
+        return "可信度高"
+    if confidence >= 0.5:
+        return "可信度中等"
+    return "可信度低，多为商家或营销说法"
+
+
 def _format_knowledge(knowledge_list: List[Dict[str, Any]], empty: str) -> str:
-    """技能payload是title/content，不是memory字段"""
-    blocks = [f"《{s['title']}》\n{s.get('content', '')[:settings.BRAIN_KNOWLEDGE_CONTENT_CHARS]}"
+    """
+    技能payload是title/content，不是memory字段。
+    每条带上可信度：联网整理的知识可信度按来源类型给（学术/官方高，媒体中等，商家营销低），
+    不带的话 System2/3 分不清哪条是研究结论、哪条是软文宣称
+    """
+    blocks = [f"《{s['title']}》（{_confidence_label(s.get('confidence'))}）\n"
+              f"{s.get('content', '')[:settings.BRAIN_KNOWLEDGE_CONTENT_CHARS]}"
               for s in knowledge_list if s.get("title")]
     return "\n\n".join(blocks) if blocks else empty
 
@@ -142,7 +163,7 @@ def _trace_memories(memories: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """召回结果的精简版（id / 分数 / 文本），不带向量和 payload 冗余字段"""
     out = []
     for m in memories:
-        score = m.get("rerank_score", m.get("score"))
+        score = m.get("rerank_score", m.get("score"))  # 知识、episodic 有 rerank 分时优先记录 rerank 分
         out.append({
             "id": m.get("id"),
             "score": round(score, 4) if isinstance(score, (int, float)) else None,
@@ -154,7 +175,7 @@ def _trace_memories(memories: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 def _build_react_trace(
     *, speaker_info: str, lies: List[str], silent: bool,
     route: str, route_reason: str, emotion: Dict[str, Any], decision: Optional[Dict[str, Any]], requires_knowledge: bool,
-    brief: List[Dict[str, Any]], episodic: List[Dict[str, Any]], knowledge: List[Dict[str, Any]],
+    brief: List[Dict[str, Any]], episodic: List[Dict[str, Any]], knowledge: List[Dict[str, Any]], episodic_cue: float,
     overall_state: Optional[Dict[str, Any]], working_memory_chars: int,
     timings: Dict[str, float], llm_usage: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
@@ -176,6 +197,8 @@ def _build_react_trace(
             "brief": _trace_memories(brief),
             "episodic": _trace_memories(episodic),
             "knowledge": _trace_memories(knowledge),
+            # 并行召回的情景记忆里 rerank 最高分（fast 路径不带 episodic，也能看到这次被勾起的程度）
+            "episodic_cue": round(episodic_cue, 4),
         },
         # 对话前的状态；对话引起的变化由异步写入的 emotion 事件记录（metadata.trace_id 关联）
         "overall_state_before": dict(overall_state) if overall_state else None,
@@ -189,6 +212,13 @@ def _build_react_trace(
 HOSTILE_ACTIONS = {"直接拒绝", "顶回去"}
 
 
+def _knowledge_hint(knowledge: List[Dict[str, Any]]) -> str:
+    """给 System1 的"我掌握什么"：只列标题，不给正文（System1 只需要知道有没有、是什么方面的）"""
+    if not knowledge:
+        return "没有直接讲这个话题的资料"
+    return "\n".join(f"- {k.get('title', '')}" for k in knowledge if k.get("title"))
+
+
 def _recent_dialogue(records: List[Dict[str, Any]], turns: int) -> str:
     """工作记忆末尾的几条原文（压缩块和当日摘要不算），给 System1 理解省略回答"""
     if turns <= 0:
@@ -197,7 +227,14 @@ def _recent_dialogue(records: List[Dict[str, Any]], turns: int) -> str:
     return format_records(raw)
 
 
-def _choose_route(emotion: Dict[str, Any], requires_knowledge: bool, speaker_known: bool = False) -> Tuple[str, str]:
+def _episodic_cue(episodic: List[Dict[str, Any]]) -> float:
+    """并行召回的情景记忆里 rerank 分数最高的一条，作为"被对方的话勾起了往事"的强度"""
+    return max((m.get("rerank_score", 0.0) for m in episodic), default=0.0)
+
+
+def _choose_route(
+    emotion: Dict[str, Any], requires_knowledge: bool, speaker_known: bool = False, episodic_cue: float = 0.0,
+) -> Tuple[str, str]:
     """
     认知路径选择，返回 (路径, 原因)。
 
@@ -205,7 +242,10 @@ def _choose_route(emotion: Dict[str, Any], requires_knowledge: bool, speaker_kno
     - 直觉拿不准（直觉行为置信度低）时不走 fast：一个接近随机的选择不应该直接变成回答
     - 对关系表里的人选了拒绝/顶回去、但话题几乎没有冲突：多半是 System1 理解错了（如没看懂省略回答），交给 System2 复核
     - 知识命中只决定"带不带知识"，不再强制进 System2；但命中知识的话题最低走 memory 路径，
-      保证把相关经历一起召回（fast 会取消 episodic，聊书时容易变浅或编造）
+      保证把相关经历一起召回（fast 不带 episodic，聊书时容易变浅或编造）
+    - 要不要带回忆，看两样，满足一样即可：System1 的 needs_memory，以及并行召回的情景记忆是否和这句话高度相关。
+      needs_memory 是小模型的一次二选一判断，同一句话两次能在 0.05 和 0.99 之间跳；
+      而往事往往是被对方的话勾起来的，召回到了高度相关的记忆，就该想起来（与知识"rerank 后还剩没剩"同理）
     """
     if emotion.get("needs_reasoning", 1.0) >= settings.BRAIN_ROUTE_REASONING_THRESHOLD:
         return ROUTE_DELIBERATE, "needs_reasoning"
@@ -220,6 +260,8 @@ def _choose_route(emotion: Dict[str, Any], requires_knowledge: bool, speaker_kno
         return ROUTE_MEMORY, "knowledge"
     if emotion.get("needs_memory", 0.0) >= settings.BRAIN_ROUTE_MEMORY_THRESHOLD:
         return ROUTE_MEMORY, "needs_memory"
+    if episodic_cue >= settings.BRAIN_EPISODIC_CUE_MIN_SCORE:
+        return ROUTE_MEMORY, "episodic_cue"
     return ROUTE_FAST, "intuitive"
 
 
@@ -227,6 +269,7 @@ def _quick_plan(
     emotion: Dict[str, Any],
     episodic: Optional[List[Dict[str, Any]]] = None,
     knowledge: Optional[List[Dict[str, Any]]] = None,
+    knowledge_gap: bool = False,
 ) -> str:
     """
     fast/memory路径的行为计划：直接来自System1的直觉行为。
@@ -240,15 +283,19 @@ def _quick_plan(
         lines.append("对方说的这件事，我记得的是（回应要落在这些具体的事上；这里没有的细节就是记不清了）：\n"
                      + _format_memories(episodic[:3], ""))
     if knowledge:
-        lines.append("我对这个话题的了解（用自己的话自然带出，不要背书）：\n"
+        lines.append("我对这个话题的了解（用自己的话自然带出，不要背书；可信度不高的内容只能说成'有资料称'，不能说成结论）：\n"
                      + _format_knowledge(knowledge, ""))
-    if not episodic and not knowledge:
+    if knowledge_gap:
+        # 只陈述事实。不知道时怎么应对（直说、凭印象说、岔开话题）是元认知，已由 System1 按人格选进了"第一反应"
+        lines.append("我手上的资料里没有直接讲这个的内容。")
+    elif not episodic and not knowledge:
         lines.append("凭直觉回应，根据行为提示、对话上下文、我和对方的关系，给出符合我性格的自然回答。")
     # fast/memory 路径没有 System2 的事实检查，只能在这里约束：别把"可以帮你做"说成"已经做了"
     lines.append("只能说已经知道的事。没有真正做过的事（联系了谁、发了什么、安排好了什么）不能说成已经做了；"
                  "可以说打算去做，或者问对方要不要做。")
-    if emotion.get("user_intent") == "提问":
-        # 不经过 System2 时，System1 的"反问对方"会让 System3 只抛回一句"你觉得呢？"而不回答
+    if emotion.get("user_intent") == "提问" and action not in ("岔开话题", "简单回答", "凭印象说"):
+        # 不经过 System2 时，System1 的"反问对方"会让 System3 只抛回一句"你觉得呢？"而不回答。
+        # 但第一反应本身就是"岔开话题"等元认知反应时，不能再强行要求正面回答
         lines.append("对方在问我问题：先正面回答（用上面记得的事和了解的东西），想反问也放在回答之后。")
     return "\n".join(lines)
 
@@ -307,6 +354,29 @@ class CyberBrain:
         self._background: set = set()
         self.knowledge_top_k = getattr(settings, 'BRAIN_KNOWLEDGE_TOP_K', 5)  # 默认召回5个知识
 
+    async def _todo_from_dialogue(self, agent_id: str, signal: str, response: str, speaker: Optional[str],
+                                  recent_dialogue: str = "") -> None:
+        try:
+            task_id = await subjectivity_service.add_todo(
+                agent_id=agent_id,
+                content=signal,
+                source="dialogue",
+                # 带上刚才的对话："查一下""好，去吧"这类确认的内容全在上一句，只看这一句会丢掉要查的主题
+                context={"signal": signal, "response": response, "speaker": speaker or "用户",
+                         "recent_dialogue": recent_dialogue},
+            )
+            if not task_id:
+                return
+            # 先写入待办再执行：去重照常生效；执行失败时任务留在待办里，worker 下次检查会重试
+            from app.service.task_executor import task_executor
+            task = next((t for t in await subjectivity_service.get_pending_tasks(agent_id)
+                         if t["task_id"] == task_id), None)
+            if task and task.get("execute_now") and await task_executor.can_execute_immediately(agent_id, task):
+                logger.info(f"Execute task immediately for {agent_id}: {task['content']}")
+                await task_executor.run_task(agent_id, task)
+        except Exception as e:
+            logger.error(f"Todo from dialogue failed for {agent_id}: {e}", exc_info=True)
+
     def _spawn(self, coro) -> None:
         task = asyncio.create_task(coro)
         self._background.add(task)
@@ -315,7 +385,8 @@ class CyberBrain:
     async def _format_speaker_info(self, speaker_name: Optional[str], agent_id: str) -> Tuple[str, bool]:
         """
         格式化说话人信息：
-        1. relationship 表有记录 → 按关系描述
+        1. relationship 表有记录 → 关系描述；若 profile 里有累计的个人信息（住址、职业、忌讳……），
+           附在后面作为"我认识的这个人"，和"我的信条"分开
         2. working memory（昨天+今天）出现过 → "有过简单接触的人"
         3. 都不在 → "一个不认识的纯陌生人"（强防备）
 
@@ -327,9 +398,14 @@ class CyberBrain:
 
         # 1. 查 relationship 表
         try:
-            relationship = await relationship_repository.get_relationship(agent_id, speaker_name)
-            if relationship:
-                return relationship, True
+            record = await relationship_repository.get(agent_id, speaker_name)
+            if record:
+                # 提示词里给关系描述 + 已知的个人信息；对方是真人还是 agent 只影响"我"主动联系对方的方式（见 outreach_service）
+                text = describe_relationship(record)
+                profile = format_profile(record.get("profile"))
+                if profile:
+                    text += (f"\n我对{speaker_name}的了解（对方自己说过的，不是我自己的事）：\n{profile}")
+                return text, True
         except Exception as e:
             logger.warning(f"Relationship lookup failed for {speaker_name}: {e}")
 
@@ -403,16 +479,11 @@ class CyberBrain:
         timings["pfc"] = (time.perf_counter() - t_pfc) * 1000
 
         # === 并行执行记忆召回和情绪分析 ===
-        async def _brief_then_system1():
-            """Brief召回后接System1情绪分析（System1依赖brief，两者串行）"""
+        async def _brief():
             t0 = time.perf_counter()
             brief = await memory_repository.search_brief(agent_id, signal, top_k=settings.BRAIN_BRIEF_TOP_K)
             timings["brief"] = (time.perf_counter() - t0) * 1000
-
-            t0 = time.perf_counter()
-            emotion = await self._system1(agent_id, brief, signal, speaker_info, state_and_situation, recent_dialogue)
-            timings["system1"] = (time.perf_counter() - t0) * 1000
-            return brief, emotion
+            return brief
 
         async def _episodic():
             """Episodic记忆召回"""
@@ -439,42 +510,52 @@ class CyberBrain:
             logger.warning(f"Query embedding prefetch failed: {e}")
         timings["embedding"] = (time.perf_counter() - t0) * 1000
 
-        # episodic 单独起任务：deliberate/memory 路径才等它，fast 路径直接取消
+        # episodic 单独起任务，与 brief、知识预取、System1 并行；路由要看它和这句话有多相关（是否被勾起了往事）
         episodic_task = asyncio.create_task(_episodic())
 
-        # brief→system1、knowledge预取并行执行（working_memory已在前置步骤完成）
-        (brief, emotion), knowledge_prefetched = await asyncio.gather(
-            _brief_then_system1(),
-            _knowledge_prefetch(),
-        )
+        # brief 与知识预取并行，都完成后再跑 System1：System1 要看到"我对这个话题掌握什么"，
+        # 才能按人格给出不知道时的第一反应（直说、凭印象说、岔开话题……），这是元认知，不由系统统一规定
+        brief, knowledge_prefetched = await asyncio.gather(_brief(), _knowledge_prefetch())
 
-        # 技能是否可用：System1 认为需要，或者预取结果本身足够相关（System1 对"非技术类技能"如古诗、养生常判断为不需要）
-        top_score = knowledge_prefetched[0]["score"] if knowledge_prefetched else 0.0
-        requires_knowledge = emotion.get("requires_knowledge", False) or top_score >= settings.BRAIN_KNOWLEDGE_SCORE_THRESHOLD
-        knowledge = knowledge_prefetched[:settings.BRAIN_KNOWLEDGE_INJECT_TOP_K] if requires_knowledge else []
+        # 是否使用知识只看 rerank 后还剩没剩：剩下的都是确实回答了这句话的条目
+        knowledge = knowledge_prefetched[:settings.BRAIN_KNOWLEDGE_INJECT_TOP_K]
+        requires_knowledge = bool(knowledge)
+
+        t0 = time.perf_counter()
+        emotion = await self._system1(
+            agent_id, brief, signal, speaker_info, state_and_situation, recent_dialogue, _knowledge_hint(knowledge)
+        )
+        timings["system1"] = (time.perf_counter() - t0) * 1000
+        # System1 认为需要知识、但资料里没有：只作为事实告诉 System3，怎么应对由直觉行为（人格）决定
+        # 只在对方是来问问题时才算缺口：对方在下指令（"去查一下 X""帮我整理……"）时，
+        # 要回应的是这个请求，不是回答 X，否则会把指令当成提问回"库里没有，要不要我记下来"
+        knowledge_gap = (emotion.get("requires_knowledge", False) and not knowledge
+                         and emotion.get("user_intent") in ("提问", "征求意见"))
         timings["knowledge"] = timings.get("knowledge_prefetch", 0.0) if requires_knowledge else 0.0
 
-        route, route_reason = _choose_route(emotion, requires_knowledge, speaker_known)
+        # 路由前等 episodic：它和 System1 并行，实测总是先于 System1 完成，这里通常不用等
+        t0 = time.perf_counter()
+        episodic = await episodic_task
+        timings["episodic_wait"] = (time.perf_counter() - t0) * 1000
+        episodic_cue = _episodic_cue(episodic)
+
+        route, route_reason = _choose_route(emotion, requires_knowledge, speaker_known, episodic_cue)
         decision: Optional[Dict[str, Any]] = None
         if route == ROUTE_FAST:
-            episodic_task.cancel()
+            # 召回了但不相关到"被勾起"的程度，fast 路径不带
             episodic = []
-            plan = _quick_plan(emotion)
+            plan = _quick_plan(emotion, knowledge_gap=knowledge_gap)
+        elif route == ROUTE_MEMORY:
+            plan = _quick_plan(emotion, episodic, knowledge, knowledge_gap)
         else:
             t0 = time.perf_counter()
-            episodic = await episodic_task
-            timings["episodic_wait"] = (time.perf_counter() - t0) * 1000
-            if route == ROUTE_MEMORY:
-                plan = _quick_plan(emotion, episodic, knowledge)
-            else:
-                t0 = time.perf_counter()
-                logger.info(f"[WorkingMemoryDebug] agent={agent_id}, working_memory length={len(working_memory)}, content={working_memory[:200]}")
-                decision = await self._system2(
-                    agent_id, brief, emotion, episodic, knowledge, working_memory, signal, speaker_info, state_and_situation
-                )
-                timings["system2"] = (time.perf_counter() - t0) * 1000
-                # System2失败时退化为直觉计划，保证总能说出话
-                plan = _format_decision(decision) if decision else _quick_plan(emotion, episodic, knowledge)
+            logger.info(f"[WorkingMemoryDebug] agent={agent_id}, working_memory length={len(working_memory)}, content={working_memory[:200]}")
+            decision = await self._system2(
+                agent_id, brief, emotion, episodic, knowledge, working_memory, signal, speaker_info, state_and_situation
+            )
+            timings["system2"] = (time.perf_counter() - t0) * 1000
+            # System2失败时退化为直觉计划，保证总能说出话
+            plan = _format_decision(decision) if decision else _quick_plan(emotion, episodic, knowledge, knowledge_gap)
 
         silent = bool(decision and decision.get("silent"))
         if silent:
@@ -518,22 +599,15 @@ class CyberBrain:
         timings["total"] = (time.perf_counter() - total_start) * 1000
         logger.info(f"react {agent_id}: route={route}({route_reason}) emotion={emotion['emotion']}({emotion['intensity']:.1f}) "
                     f"action={emotion.get('quick_action')} requires_knowledge={requires_knowledge} brief={len(brief)} "
-                    f"episodic={len(episodic)} knowledge={len(knowledge)} timings={ {k: round(v) for k, v in timings.items()} }")
+                    f"episodic={len(episodic)} episodic_cue={episodic_cue:.2f} knowledge={len(knowledge)} timings={ {k: round(v) for k, v in timings.items()} }")
 
-        # 🔥 评估并持久化重要记忆（同步等待完成）
-        await memory_gate_service.evaluate_and_persist(agent_id, signal, speaker or "user")
+        # 评估并持久化重要记忆：只影响以后的召回（本轮已回答完，下一轮靠 PFC 里的原文），放后台，不阻塞本轮返回。
+        # "先重激活、再写入"的顺序在 evaluate_and_persist 内部保证
+        self._spawn(memory_gate_service.evaluate_and_persist(agent_id, signal, speaker or "user"))
 
-        # 判断是否生成待办：要调两次模型（System One + lite），放后台执行，不阻塞本轮返回
-        self._spawn(subjectivity_service.add_todo(
-            agent_id=agent_id,
-            content=signal,
-            source="dialogue",
-            context={
-                "signal": signal,
-                "response": response,
-                "speaker": speaker or "用户"
-            }
-        ))
+        # 判断是否生成待办：要调两次模型（System One + lite），放后台执行，不阻塞本轮返回。
+        # 判断为"现在就该做"的联网任务，写入后立即执行，不等 worker 排期
+        self._spawn(self._todo_from_dialogue(agent_id, signal, response, speaker, recent_dialogue))
 
         # 🆕 记录 react 输出事件（说过的话），本轮完整中间状态放在顶层 trace 字段，耗时放在顶层 rt 字段
         timings["react_total"] = (time.perf_counter() - react_start) * 1000
@@ -551,7 +625,7 @@ class CyberBrain:
             trace=_build_react_trace(
                 speaker_info=speaker_info, lies=lies, silent=silent, route=route, route_reason=route_reason,
                 emotion=emotion, decision=decision, requires_knowledge=requires_knowledge,
-                brief=brief, episodic=episodic, knowledge=knowledge,
+                brief=brief, episodic=episodic, knowledge=knowledge, episodic_cue=episodic_cue,
                 overall_state=subject_context.overall_state if subject_context else None,
                 working_memory_chars=len(working_memory or ""),
                 timings=timings, llm_usage=llm_usage,
@@ -594,6 +668,7 @@ class CyberBrain:
         speaker_info: str,
         situation_context: str = "",
         recent_dialogue: str = "",
+        knowledge_hint: str = "",
     ) -> Dict[str, Any]:
         """
         潜意识情绪反应：使用tev1快速分析情绪、冲动、投入意愿和认知门控
@@ -611,7 +686,7 @@ class CyberBrain:
 
             # 调用 System One API（传入 situation_context）
             emotion = await system1_tev1.analyze(
-                brief_text, signal, persona_text, speaker_info, situation_context, recent_dialogue
+                brief_text, signal, persona_text, speaker_info, situation_context, recent_dialogue, knowledge_hint
             )
 
             return emotion
@@ -638,16 +713,42 @@ class CyberBrain:
                 agent_id=agent_id,
                 query=signal,
                 limit=self.knowledge_top_k,
-                score_threshold=0.5,
+                score_threshold=settings.BRAIN_KNOWLEDGE_SCORE_THRESHOLD,
             )
-
-            logger.debug(f"Knowledge recall: query='{signal[:50]}...', found={len(knowledges)} items")
-
-            return knowledges
+            if not knowledges:
+                return []
+            return await self._rerank_knowledge(signal, knowledges)
 
         except Exception as e:
             logger.error(f"Knowledge recall failed: {e}", exc_info=True)
             return []
+
+    async def _rerank_knowledge(self, signal: str, knowledges: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        余弦只能说明"话题相关"：知识库主题单一时，任何同主题的问题都能召回 0.55 以上的条目
+        （如"NAD+ 有用吗"召回了只沾"抗衰老"边的实验数据）。rerank 判断的是"这段内容是否回答了这个问题"，
+        低于 BRAIN_KNOWLEDGE_RERANK_MIN_SCORE 的丢掉；全部被丢掉就是库里没有相关知识。
+
+        rerank 调用失败时 rerank_client 会退化成按原顺序递减的假分数，不能当真：
+        此时退回只用余弦，保守地只保留余弦 ≥ 0.6 的条目
+        """
+        docs = [f"{k.get('title', '')}\n{k.get('content', '')}" for k in knowledges]
+        try:
+            results = await rerank_client.rerank_strict(signal, docs)
+        except Exception as e:
+            logger.warning(f"Knowledge rerank failed, fallback to cosine >= 0.6: {e}")
+            return [k for k in knowledges if k.get("score", 0.0) >= 0.6]
+
+        kept = []
+        for r in results:
+            k = dict(knowledges[r["index"]])
+            k["rerank_score"] = r["relevance_score"]
+            if k["rerank_score"] >= settings.BRAIN_KNOWLEDGE_RERANK_MIN_SCORE:
+                kept.append(k)
+        kept.sort(key=lambda k: k["rerank_score"], reverse=True)
+        logger.info(f"Knowledge rerank: {len(knowledges)} candidates -> {len(kept)} relevant "
+                    f"(scores={[round(r['relevance_score'], 3) for r in results]})")
+        return kept
 
     async def _validate_fact_sources(
         self,
@@ -791,13 +892,16 @@ class CyberBrain:
         overall_state: str,
     ) -> str:
         """
-        语言行为实现：把已决定的行为转成"我"的口语。只给speaking_manner（说话习惯）和整体状态（影响语气），
-        不给记忆、信条和处境——要说的事实都已经在plan里，多给只会让它补内容。
+        语言行为实现：把已决定的行为转成"我"的口语。给本能层的自我认知（persona_system1）、
+        speaking_manner（说话习惯）和整体状态（影响语气），不给记忆、信条和处境——要说的事实都已经在plan里，多给只会让它补内容。
         返回带[谎言]标记的原始输出，由调用方解析。
         """
         persona = await persona_manager.get(agent_id)
         messages = [
-            {"role": "system", "content": SYSTEM3_PROMPT.format(speaking_manner=persona["speaking_manner"])},
+            # 本能层的自我认知（persona_system1）每一轮都在场：认识对方（speaker_info）和认识自己都是本能，
+            # 不该依赖是否走了 System2。否则 fast 路径被问"你是谁"时，System3 只能套用说话习惯里的句式
+            {"role": "system", "content": SYSTEM3_PROMPT.format(
+                self_identity=persona["system1"], speaking_manner=persona["speaking_manner"])},
             {"role": "user", "content": SYSTEM3_USER_TEMPLATE.format(
                 speaker_info=speaker_info,
                 overall_state=overall_state or "【当前整体状态】\n（无）",

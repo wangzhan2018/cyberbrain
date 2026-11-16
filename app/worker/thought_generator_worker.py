@@ -87,6 +87,13 @@ class ThoughtGeneratorWorker:
                 }
             )
 
+            # 想说给某人听的念头（如对主人的关心）：由人格判断此刻要不要主动说出来
+            try:
+                from app.service.outreach_service import outreach_service
+                await outreach_service.maybe_express_thought(agent_id, thought)
+            except Exception as e:
+                logger.error(f"Express thought failed for {agent_id}: {e}", exc_info=True)
+
     async def generate_on_trigger(
         self,
         agent_id: str,

@@ -69,4 +69,24 @@ class RerankClient:
             ]
 
 
+    async def rerank_strict(self, query: str, documents: List[str]) -> List[Dict[str, Any]]:
+        """
+        与 rerank 相同，但失败时抛出异常而不是返回按原顺序递减的假分数。
+        用 rerank 分数做"是否相关"的判断时必须用这个：假分数会让所有候选都通过阈值
+        """
+        if not documents:
+            return []
+        response = await asyncio.to_thread(
+            dashscope.TextReRank.call,
+            model=settings.RERANK_MODEL,
+            query=query,
+            documents=documents,
+            top_n=len(documents),
+            return_documents=False,
+        )
+        if response.status_code != HTTPStatus.OK:
+            raise RuntimeError(f"Rerank API error: {response.code} - {response.message}")
+        return [{"index": r.index, "relevance_score": r.relevance_score} for r in response.output.results]
+
+
 rerank_client = RerankClient()

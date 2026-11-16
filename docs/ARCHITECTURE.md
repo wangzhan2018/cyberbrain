@@ -19,12 +19,13 @@
 11. [Memory Gate：记忆门控](#memory-gate记忆门控)
 12. [主体性：3F 模型](#主体性3f-模型)
 13. [待办与自主行为](#待办与自主行为)
-14. [后台 Worker](#后台-worker)
-15. [生命事件](#生命事件)
-16. [管理接口与运行时配置](#管理接口与运行时配置)
-17. [模型调用一览](#模型调用一览)
-18. [已知问题与限制](#已知问题与限制)
-19. [理论参考](#理论参考)
+14. [主动触达](#主动触达)
+15. [后台 Worker](#后台-worker)
+16. [生命事件](#生命事件)
+17. [管理接口与运行时配置](#管理接口与运行时配置)
+18. [模型调用一览](#模型调用一览)
+19. [已知问题与限制](#已知问题与限制)
+20. [理论参考](#理论参考)
 
 ---
 
@@ -76,7 +77,9 @@
 | `persona:{agent_id}:system2` | String | System2 人格片段：身份、能力边界、元认知、诚信倾向 | 同上 |
 | `persona:{agent_id}:speaking_manner` | String | System3 的说话习惯 | 同上 |
 | `subject_context:{agent_id}` | String（JSON） | 主体性上下文：`situation`、`overall_state`、`thoughts`、`pending_tasks`（只含待执行的任务）、`recent_done`（近期完成/取消任务，用于去重）、`last_update`。**每次写入都会把过期时间重置为 30 天** | 主体性服务 |
-| `agent:{agent_id}:relationships` | Hash | field 为人名，value 为 `"关系类型，描述"` | 初始化 / 更新接口、每日整理 |
+| `agent:{agent_id}:relationships` | Hash | field 为人名，value 为 JSON `{kind, agent_id, relationship, description}`；旧格式 `"关系类型，描述"` 按 kind=human 读取 | 初始化 / 更新接口、每日整理 |
+| `agent:{agent_id}:capabilities` | Set | agent 的能力，目前只有 `web_search`；不存在即没有任何能力 | 初始化 / 更新接口 |
+| `outbox:{agent_id}:{人名}` | List | agent 主动想对这个人（kind=human）说的话，最多保留 50 条，`GET /brain/fetch_talk` 取走即删除 | 主动触达 |
 | `wm:{agent_id}:stm` | List | 工作记忆原文，每条一个 JSON：`{type: "raw", role, speaker, content, lies?}` | react |
 | `wm:{agent_id}:stm:compress` | List | 压缩块或当日摘要：`{type: "compress" \| "daily", summary, speakers, count?}` | 滚动压缩、每日整理 |
 | `subject_context:{agent_id}:tasks_lock` | String | 待办读-改-写的锁（10 秒过期） | 主体性服务 |
@@ -125,23 +128,23 @@ mem0 的记忆变更历史库：`./data/brief_history.db`、`./data/episodic_his
   ├─ 预计算一次查询向量（写入缓存，三路召回共用）
   │
   ├─ 并行：
-  │    ├─ Episodic 召回（单独的 task，fast 路径会被取消）
-  │    ├─ Brief 召回 ──▶ System1
-  │    └─ Knowledge 预取
+  │    ├─ Episodic 召回（单独的 task，与 System1 并行，路由前等它完成）
+  │    ├─ Brief 召回
+  │    └─ Knowledge 预取（余弦粗筛 + rerank）
+  ├─ System1（看得到 Brief 和"我对这个话题掌握什么"）
   │
-  ├─ 判断是否使用知识 → 选择认知路径
-  │    ├─ fast：取消 Episodic，直觉计划
-  │    ├─ memory：等 Episodic，直觉计划 + 想起的往事 + 知识
-  │    └─ deliberate：等 Episodic → System2 → 决策计划（失败时退回直觉计划）
+  ├─ 判断是否使用知识、是否被勾起了往事（Episodic 最高分）→ 选择认知路径
+  │    ├─ fast：不带 Episodic，直觉计划
+  │    ├─ memory：直觉计划 + 想起的往事 + 知识
+  │    └─ deliberate：System2 → 决策计划（失败时退回直觉计划）
   │
   ├─ System3 生成说出口的话（System2 决定不说话时跳过）
   ├─ 解析 [谎言] 标记；把"我"的回应（或"（没有接话）"）写入工作记忆
   │
-  ├─ 同步执行（返回前完成）：
-  │    ├─ Memory Gate：评估并持久化对方这句话
-  │    └─ 记录 react_output 事件（含完整 trace）
+  ├─ 同步执行（返回前完成）：记录 react_output 事件（含完整 trace）
   │
-  ├─ 异步执行（不阻塞返回）：判断这轮对话是否产生待办；根据情绪调整整体状态、可能生成念头
+  ├─ 异步执行（不阻塞返回）：Memory Gate 评估并持久化对方这句话；判断这轮对话是否产生待办；
+  │    根据情绪调整整体状态、可能生成念头
   └─ 返回
 ```
 
@@ -169,7 +172,7 @@ mem0 的记忆变更历史库：`./data/brief_history.db`、`./data/episodic_his
 
 实现：`app/service/system1_tev1.py`。调用火山引擎方舟的 **System One 决策接口**（`doubao_client.decide()`，请求头带 `ark-beta-systemone-api: true`，默认模型 `DOUBAO_MODEL_LITE`）。它不生成文本，而是对一组问题做选择或打分，并返回概率。
 
-**输入上下文**（按顺序拼接）：对方是谁 → 主体性上下文（整体状态 + 处境）→ System1 人格片段 → Brief 记忆 → 刚才的对话（工作记忆末尾 `BRAIN_SYSTEM1_RECENT_TURNS` 条原文，默认 4 条，不含本句和压缩摘要）→ 外部信号（信号前再标一次说话人，小模型对紧邻信号的内容权重更高）。
+**输入上下文**（按顺序拼接）：对方是谁 → 主体性上下文（整体状态 + 处境）→ System1 人格片段 → Brief 记忆 → 我对这个话题掌握的资料（rerank 后命中知识的标题，或"没有直接讲这个话题的资料"）→ 刚才的对话（工作记忆末尾 `BRAIN_SYSTEM1_RECENT_TURNS` 条原文，默认 4 条，不含本句和压缩摘要）→ 外部信号（信号前再标一次说话人，小模型对紧邻信号的内容权重更高）。
 
 给 System1 最近对话，是因为"需要""好的""不用了"这类省略回答的意思全在上一句；只看孤立的两个字，System1 只能猜。
 
@@ -185,7 +188,7 @@ mem0 的记忆变更历史库：`./data/brief_history.db`、`./data/episodic_his
 | `conflict` | score | 话题与"我"的价值观、专业、在意的事的冲突程度 |
 | `requires_knowledge` | noul | 是否需要专业知识 |
 | `user_intent` | choice | 对方意图 14 类（寒暄问候、闲聊、开玩笑、分享近况、提问、求助、征求意见、倾诉、邀约、批评质疑、挑衅冒犯、提起往事、正常讨论观点、其他） |
-| `quick_action` | choice | 直觉行为 12 种（随口接话、调侃回去、反问对方、敷衍应付、关心对方、爽快答应、直接拒绝、顶回去、简单回答、岔开话题、愣住或追问、得想一想） |
+| `quick_action` | choice | 直觉行为 13 种（随口接话、调侃回去、反问对方、敷衍应付、关心对方、爽快答应、直接拒绝、顶回去、简单回答、岔开话题、愣住或追问、凭印象说、得想一想）。问到自己不掌握的东西时，按人格自然反应 |
 | `needs_memory` | noul | 是否必须想起具体往事才能接话 |
 | `needs_reasoning` | noul | 是否需要停下来认真想 |
 
@@ -212,14 +215,22 @@ mem0 的记忆变更历史库：`./data/brief_history.db`、`./data/episodic_his
 | 4 | `action_confidence` < `BRAIN_ROUTE_MIN_ACTION_CONFIDENCE`（0.55） | deliberate | `low_action_confidence` |
 | 5 | 使用知识 | memory | `knowledge` |
 | 6 | `needs_memory` ≥ `BRAIN_ROUTE_MEMORY_THRESHOLD`（0.6） | memory | `needs_memory` |
-| 7 | 以上都不满足 | fast | `intuitive` |
+| 7 | 并行召回的 Episodic 中 rerank 最高分 ≥ `BRAIN_EPISODIC_CUE_MIN_SCORE`（0.75） | memory | `episodic_cue` |
+| 8 | 以上都不满足 | fast | `intuitive` |
 
 - 第 3 条：对认识的人选了拒绝、话题却几乎没有冲突，多半是 System1 理解错了，交给 System2 复核。对陌生人的拒绝、或冲突确实很高时的拒绝，仍按直觉执行
 - 第 4 条：直觉行为的概率分散时（多个选项都差不多），这个选择接近随机，不应该直接变成回答
 - 命中知识不会强制进 System2，但最低走 memory 路径，保证把相关经历一起召回。
-- fast 路径不等 Episodic 召回，直接取消该任务。
+- 第 6、7 条满足一条就带回忆。`needs_memory` 是小模型的一次二选一判断，很不稳定：同一句"我之前跟你说要去哪儿开民宿来着？"、同样的输入，两次分别给出 0.47 和 0.05，改问题措辞也只是换一种不稳定。而往事往往是被对方的话勾起来的：Episodic 召回本来就和 System1 并行，召回到和这句话高度相关的记忆，就该想起来，与知识"rerank 后还剩没剩"同理。实测（rerank 分数）：需要回想往事的句子 0.81–0.98；不需要的句子 0–0.66，其中较高的是"你觉得《百年孤独》好看吗"勾起的读书经历（0.66），这类被话题勾起的自身经历本来就该想起
+- Episodic 召回在路由前等待完成，因为第 7 条要看它。它与 System1 并行，实测（150–230ms，System1 约 370–720ms）总是先完成，通常不额外耗时；等待时间记在 `episodic_wait`。走 fast 时不把召回结果带进计划。trace 的 `recall.episodic_cue` 记录这一轮的最高分
 
-**是否使用知识：** System1 判断需要知识，或预取结果的最高分 ≥ `BRAIN_KNOWLEDGE_SCORE_THRESHOLD`（0.5）。使用时取前 `BRAIN_KNOWLEDGE_INJECT_TOP_K`（2）条，每条正文截断到 `BRAIN_KNOWLEDGE_CONTENT_CHARS`（1200）字。由于预取本身的相似度阈值也是 0.5，**实际上只要预取到知识就会使用**。
+**知识注入时带可信度：** 每条知识的标题后附可信度标签（高 ≥ 0.75 / 中等 ≥ 0.5 / 低，多为商家或营销说法），给文字不给数值。System2 的提示词和直觉计划里都写明：可信度不高的内容只能说成"有资料称"，不能当成结论。
+
+**是否使用知识：** 只看 rerank 之后还剩没剩（见 [Knowledge](#knowledge专业知识)）。剩下的条目按 rerank 分数排序，取前 `BRAIN_KNOWLEDGE_INJECT_TOP_K`（2）条，每条正文截断到 `BRAIN_KNOWLEDGE_CONTENT_CHARS`（1200）字。
+
+System1 认为需要知识、但 rerank 后一条都不剩，**并且对方是在提问或征求意见**时，记为"知识缺口"（对方在下指令时，如"去查一下 X"，要回应的是这个请求，不算缺口），直觉计划里只写一句事实"我手上的资料里没有直接讲这个的内容"，不规定该怎么应对。
+
+**不知道时怎么表现由人格决定**：直说不知道、凭印象说、岔开话题、反问对方，都是元认知的体现，因人而异。System1 在知识预取完成后才运行，输入里有"我对这个话题掌握的资料"（命中知识的标题，或"没有直接讲这个话题的资料"），由它按人格选出直觉行为（如"简单回答""凭印象说""岔开话题""反问对方"），System3 照此执行。元认知要写在人格里（`persona_system1` 决定第一反应，`persona_system2` 决定深思时的判断），不要写进说话习惯。
 
 **直觉计划（fast / memory 路径）：** 由 `_quick_plan()` 生成，内容包括对方意图、"我的第一反应"及其说明；memory 路径附上最多 3 条想起的往事（并说明"这里没有的细节就是记不清了"）和命中的知识；对方在提问时，要求先正面回答再反问；并且始终提醒：没有真正做过的事（联系了谁、发了什么、安排好了什么）不能说成已经做了，只能说打算做或问对方要不要做。fast / memory 路径没有 System2 的事实检查，这条约束只能放在计划里。
 
@@ -260,7 +271,9 @@ mem0 的记忆变更历史库：`./data/brief_history.db`、`./data/episodic_his
 
 实现：`cyber_brain._system3()`，模型 `DOUBAO_MODEL_CHARACTER`，温度 `BRAIN_SYSTEM3_TEMPERATURE`（0.5），最大 token `BRAIN_SYSTEM3_MAX_TOKENS`（1000）。
 
-**刻意只给少量信息：** 说话习惯（`speaking_manner`）、对方是谁、整体状态（不含处境）、工作记忆、对方这句话、本能反应（文字版）、行为计划。**不给 Brief、Episodic、知识和处境**：要说的事实都已经在计划里，多给只会让它自己补内容。
+**刻意只给少量信息：** 本能层的自我认知（`persona_system1`，标注为"用来把握身份和分寸，不是要说出来的内容"）、说话习惯（`speaking_manner`）、对方是谁、整体状态（不含处境）、工作记忆、对方这句话、本能反应（文字版）、行为计划。**不给 Brief、Episodic、知识和处境**：要说的事实都已经在计划里，多给只会让它自己补内容。
+
+给自我认知的原因：认识对方（说话人信息）和认识自己一样是本能，每一轮都应在场，不能依赖是否走了 System2。否则 fast 路径上被问"你是谁、你能做什么"时，System3 不知道自己是谁，只能套用说话习惯里的句式。
 
 提示词（`SYSTEM3_PROMPT`）要求：忠实执行计划、只表达对外内容、自然口语、长度由计划决定、不增加任何具体人物/地点/数字/经历、不得声称已经完成了计划里没写明已完成的动作（如"已为您联系"）、不用括号旁白、使用对方的语言、只在计划指定的假话句末加 `[谎言]`。
 
@@ -335,13 +348,20 @@ Brief 只用于 System1 和 System2。
 `knowledge_memory_service`，通过 `GenericQdrantClient` 直接读写 Qdrant：
 
 - 类型：`concept`、`howto`、`best_practice`、`troubleshooting`、`example`；来源：`experience`、`learning`、`project`、`documentation`。非法值会被替换为默认值
-- 检索：稠密向量，按 `agent_id` 过滤，取 5 条，相似度阈值 0.5（这两个值目前写在代码里，不在配置中）
+- 检索分两步：
+  1. 稠密向量召回，按 `agent_id` 过滤，取 5 条，余弦 ≥ `BRAIN_KNOWLEDGE_SCORE_THRESHOLD`（0.5）
+  2. `qwen3-rerank` 判断每条是否回答了这句话，低于 `BRAIN_KNOWLEDGE_RERANK_MIN_SCORE`（0.5）的丢掉
+
+  只靠余弦分不开"话题相关"和"回答了问题"：知识库主题单一时，同主题的任何问题都能召回 0.55 以上的条目。实测（17 条抗衰老知识）：库里没有答案的问题（NAD+、二甲双胍、断食等），召回条目的 rerank 分最高 0.484；库里有答案的问题，正确条目的 rerank 分最低 0.529。rerank 调用失败时，退回只保留余弦 ≥ 0.6 的条目
+- 召回条数（5）仍写在代码里，不在配置中
 - 每轮 react 都会预取，是否注入见[认知路径选择](#认知路径选择)
 - 写入来源：初始化接口、追加记忆接口。Memory Gate 不会写 Knowledge
 
 ### Relationship（人际关系）
 
-Redis Hash，只做精确的人名匹配，用于[说话人识别](#说话人识别)。写入来源：初始化 / 更新接口、每日整理时自动记录的新陌生人。
+Redis Hash，只做精确的人名匹配，用于[说话人识别](#说话人识别)。写入来源：初始化 / 更新接口、每日整理时自动记录的新陌生人（kind=human）。
+
+每条关系记录对方的**类型**：`kind = human`（真人）或 `agent`（另一个 agent，必须同时记录对方的 `agent_id`）。类型只决定"我"[主动联系对方的方式](#主动触达)，不进入提示词；提示词里的关系描述与以前一样是"关系类型，描述"。校验在接口模型和存储层各做一次：kind=agent 必须有 agent_id，kind=human 不能有 agent_id。
 
 ### 工作记忆（PFC）
 
@@ -358,7 +378,7 @@ Redis Hash，只做精确的人名匹配，用于[说话人识别](#说话人识
 
 ## Memory Gate：记忆门控
 
-实现：`memory_gate_service.evaluate_and_persist()`。在每轮 react 返回前执行，**只评估对方说的话**（signal），不评估"我"的回应。评估与 Episodic [重激活](#episodic情景记忆)并行进行。
+实现：`memory_gate_service.evaluate_and_persist()`。每轮 react 生成回复后在后台执行，不阻塞本轮返回（它只影响以后的召回；下一轮靠工作记忆里的原文，不依赖它写完），**只评估对方说的话**（signal），不评估"我"的回应。评估与 Episodic [重激活](#episodic情景记忆)并行进行。
 
 **评估**：一次 System One 请求问两个问题：
 
@@ -376,12 +396,24 @@ Redis Hash，只做精确的人名匹配，用于[说话人识别](#说话人识
 
 | 条件 | 处理 |
 |---|---|
-| importance = 0 | 丢弃 |
-| EPISODIC 且 importance < 3 | 不写长期记忆（只留在工作记忆里） |
-| EPISODIC 且 importance ≥ 3 | 写入 Episodic |
-| SEMANTIC 且 importance ≥ 1 | 写入 Brief |
+| importance < 3 | 不写长期记忆（只留在工作记忆里） |
+| importance ≥ 3（不论判为 EPISODIC / SEMANTIC） | 写入 Episodic，metadata 多存一个 `gate_type` |
+| 含说话人本人的稳定个人信息（见下） | 融合进关系表里这个人的 profile |
 
-说话人不是 `user` / `self` 时，写入内容为"{说话人}对我说：{原话}"，避免丢失说话人。metadata 包含 `speaker`、`importance`、`source: memory_gate`、`timestamp`。
+**对话不直接写 Brief。** Brief 是"我的信条"（对自我的判断），对话里是"对方说的话"。对方一句重要的话落地时是经历，要经过反思（见[反思](#反思reflection-worker)）才可能变成对自己的认识。直接铸成信条等于替 agent 决定了它该怎么被影响，而且 Brief 不衰减、不重激活、没有删除接口。所以 Brief 只由初始化和反思写入。
+
+说话人不是 `user` / `self` 时，写入内容为"{说话人}对我说：{原话}"，避免丢失说话人。metadata 包含 `speaker`、`importance`、`gate_type`、`source: memory_gate`、`timestamp`。
+
+**个人信息（profile）：** 评估时多问一个 `person_fact`（这句话里说话人有没有主动说出关于他自己的稳定信息）。概率 ≥ 0.6 时，用一次 LLM 抽取到受控槽位（姓名、住址、职业、家庭成员、过敏与禁忌……共 16 个，见 `PROFILE_SLOTS`），融合进关系表里这个人的 `profile`。规则：
+
+- **陌生人忽略**：不在关系表里的人说了个人信息也不记（路人一上来就说自己的事，人也会听着、但不会认真记下）
+- **去重**：同一槽位、同一值只累计 `mentions` 和 `last_confirmed_at`，不新增条目
+- **覆盖**：单值槽位（住址、职业……）新值生效，旧值进 `history`（最多 2 条），答得出"他以前住北京"
+- **列表槽位**（家庭成员、过敏与禁忌、长期偏好、忌讳、习惯、重要日期）：同一值不重复，最多 8 条
+- **不覆盖关系**：`relationship` / `description` 不受影响；更新关系时不传 profile 会保留已有资料
+- 与关系描述共用一个 Hash（`agent:{agent_id}:relationships`）的 value，不额外开 key
+
+读取时随说话人描述一起给 System1/2/3：`我对{人名}的了解（对方自己说过的，不是我自己的事）：- 住址：上海……`，与"我的信条"明确分开。
 
 **写入后更新处境：** 再发一次 System One 请求，判断这条信息是否需要更新处境。需要时用 `SITUATION_UPDATE_PROMPT` 让 LLM 输出新的完整处境 JSON，通过 `replace_situation()` 整体替换保存；新处境中 3 天内到期的每个事件让压力 +0.1。不需要更新时也会调用一次整体状态调整（增量为 0，相当于按当前压力重算精力）。
 
@@ -440,27 +472,47 @@ Redis Hash，只做精确的人名匹配，用于[说话人识别](#说话人识
 
 ## 待办与自主行为
 
+### 能力（Capabilities）
+
+联网搜索是一个很具体的机制：对话中答应"去查"的事几秒后就交来一份带出处的整理，结果写进知识库，再主动通知对方。这适合个人知识库助手，但不适合拟人角色：一个说"回头帮你查查"的朋友，半分钟后交来结构化清单，就不像人了；知识库也会被搜索摘要填满。
+
+所以能不能联网是 **agent 级别的能力开关**（`agent:{agent_id}:capabilities`），不写进人格、也不交给提示词判断：这是 agent 客观上有没有这个工具，不是性格。由 `initialize_agent` / `PUT /admin/agent` 的 `capabilities` 设置，**默认没有任何能力**。
+
+| | 有 `web_search` | 没有（默认） |
+|---|---|---|
+| 对话 / 念头漏斗 | 问 `needs_web_search`（对话漏斗还问 `execute_now`） | 不问，任务里两项都是 false，System One 请求少两个问题 |
+| 立即执行 | 联网任务写入后立即执行 | 不立即执行 |
+| 执行 | 联网搜索 → 写入 Knowledge → 通知委托人 | 按普通任务执行，不联网 |
+
+没有联网能力时，"回头帮你查查"仍然是一个普通待办，到时候按普通任务执行。
+
 ### 待办的产生（`add_todo`）
 
-**来自对话**（每轮 react 结束时在后台执行，不阻塞返回）：
+**来自对话**（每轮 react 结束时在后台执行，不阻塞返回）。判断和提炼都会带上最近几条对话（与 System1 相同）："查一下""好，去吧"这类确认的内容全在上一句，只看当前一句会丢掉要做的事：
 
-1. System One 粗判两件事：
+1. System One 一次请求判断以下几件事（后两项只在 agent 有 `web_search` 能力时问，见[能力](#能力capabilities)）：
    - `has_commitment`：对方明确请求了某个行动，且"我"明确答应了
    - `needs_interaction`：完成任务是否需要去找某人沟通
-2. `has_commitment = yes` 且置信度 > 0.5 时，交给 lite 模型（`DOUBAO_MODEL_LITE`，温度 0，最多 80 token）一次完成三件事：
-   - 再确认"我"是否真的答应了要做某件事，没有就只输出"无"
+   - `needs_web_search`：完成任务是否需要上网查资料获取还不知道的信息
+   - `execute_now`：是不是现在就该着手（对方要求现在做，或没提时间且立刻能动手）；指定了以后的时间、要等条件、到时候的提醒都算否
+2. `has_commitment` 的 yes 概率 ≥ 0.85 时，交给 lite 模型（`DOUBAO_MODEL_LITE`，温度 0，最多 80 token）完成两件事（不再二次判断有没有任务：实测同一输入约 1/4 的概率误答"无"）：
    - 把对方的原话提炼成任务描述（30 字内，不照抄原话）
    - 按话里的时间推算截止日期（`YYYY-MM-DD`），提示词里带今天的日期和星期，"明早""下周三""月底"都能推算；没提时间则为空
    
    提示词约 150 token，输出是一两行纯文本（不用 JSON），实测单次约 1 秒
 3. 通过后创建：优先级 0.8，相关人为说话人
 
-需要沟通时，任务带 `interaction_type: "dialogue"`。
+需要沟通时，任务带 `interaction_type: "dialogue"`；需要联网时带 `needs_web_search: true`；现在就该做时带 `execute_now: true`。
 
-**来自念头**（Thought Generator Worker）：
+**立即执行：** 待办照常写入（去重仍然生效），写入后如果 `execute_now = true`、是**联网任务**且 agent 有 `web_search` 能力，`cyber_brain` 立即调用 `task_executor.run_task()` 执行，不等 Task Reminder 排期，执行完从待办中移除；执行失败则留在待办里，由 worker 下次检查重试。只放开联网任务，原因是：
+- 普通任务的"执行"是 LLM 编一句完成结果，立即执行会让下一轮对话就出现没做过的事
+- 对话中生成的社交任务，联系对象固定是当前说话人（正在对话的人），立即"主动联系"没有意义
 
-1. 念头含行动类关键词（得、要、应该、找、联系、问、准备、安排、约等）→ 直接创建，内容为完整念头，优先级 0.6
-2. 否则问 System One 是否需要转为待办：置信度 > 0.7 直接创建；0.5–0.7 再让 LLM 判断
+`run_task()` 用一个进程内集合记录正在执行的任务，对话中立即执行和 worker 定时检查碰到同一个任务时不会重复执行。
+
+**来自念头**（Thought Generator Worker）：一次 System One 请求同时判断 `need_task`（有没有想去做的具体事情，包括想去了解、查明、补充某个知识）和 `needs_web_search`（只在有 `web_search` 能力时问）。`need_task` 的 yes 概率 ≥ 0.8 直接创建（优先级即该概率），0.6–0.8 再让 LLM 确认，更低不创建。
+
+> 判断用的是 System One 返回的 `probabilities["yes"]`，不是 `confidence`：后者表示判断有多确定（约为 1 − 熵），yes 概率 0.755 时 `confidence` 只有 0.197，不能当作"yes 的概率"用。
 
 **存储与去重：**
 
@@ -489,14 +541,51 @@ Redis Hash，只做精确的人名匹配，用于[说话人识别](#说话人识
 
 用任务 ID 的哈希代替随机数，同一任务每次检查的结论一致。
 
-**执行方式：**
+**执行方式：**（`execute_task` 按以下顺序判断，联网优先：决策模型常把"查一下补进知识库"同时判为需要联系人，但这类任务的实质是获取信息）
 
-- **普通任务**：LLM 用第一人称模拟一句完成结果，以"[自主完成] …"写入 Episodic；学习类任务（含"学习、了解、研究"等）还会尝试写入 Knowledge；再让 LLM 判断是否更新处境（当前活动 / 事件完成 / 新的持续状态）
-- **社交任务**（`interaction_type = dialogue`）：LLM 生成一句 15 字以内的开场白，以发起方为说话人，调用**目标 Agent**（`related_person` 作为目标 agent_id）的 `react()`；把双方的话写成一段经历存入发起方的 Episodic，并在发起方处境中追加 `recent_contacts`（保留最近 10 条）
+- **联网任务**（`needs_web_search = true`，且 agent 有 `web_search` 能力；执行时再查一次能力，没有能力的按普通任务执行。开关关闭前生成的、或通过接口直接写入的联网任务不经过漏斗，靠这一步拦住）：
+  1. LLM 把待办改写成**两个**查询词：一个直接查这件事，一个查它的风险、局限、反面证据或争议。两次 Tavily 搜索并行（`app/client/web_search_client.py`，每次取 `WEB_SEARCH_MAX_RESULTS` 条），结果按链接去重合并。只搜一次时，结果偏向哪一边，知识就偏向哪一边
+  2. 搜索优先返回 `WEB_SEARCH_PREFER_DOMAINS` 中的站点（学术期刊、PubMed、卫健委等，Tavily 的 `prefer` 模式：只是优先，不够时仍会补充其他站点）
+  3. LLM 先判断每条结果的**来源类型**（学术研究 / 官方或专家共识 / 新闻媒体 / 商家或营销），再**只根据摘录**整理出 1–3 条知识。正文要写明说法出自哪类来源，正反证据都写，只有动物实验或小样本时要写明，不能把商家说法写成结论，并用 `[1][2]` 标注出处
+  4. 每条知识写入 Knowledge：可信度按引用来源中**最可靠的类型**给（学术研究、官方或专家共识 0.75，新闻媒体 0.55，商家或营销 0.35），正文末尾附每条来源的标题、类型和链接，`source = learning`
+  5. 写入一条 Episodic 经历（"为了 X 上网查了资料，整理进知识库：……"或"……没找到可靠内容"），metadata 带两个查询词和来源链接
+  
+  未配置 `TAVILY_API_KEY` 或搜索失败时，任务返回失败、**保持待执行**，下次检查再试，不编造结果
+- **普通任务**：LLM 用第一人称模拟一句完成结果，以"[自主完成] …"写入 Episodic，再让 LLM 判断是否更新处境（当前活动 / 事件完成 / 新的持续状态）。模拟结果不再写入 Knowledge
+- **社交任务**（`interaction_type = dialogue`）：先校验 `related_person` 是已存在的 agent（有 persona），不是则**取消任务**（不调用 react，避免以人名为 agent_id 创建出游离数据，也避免 worker 每次检查都重试）。校验通过后，LLM 生成一句 15 字以内的开场白，以发起方为说话人，调用**目标 Agent**（`related_person` 作为目标 agent_id）的 `react()`；把双方的话写成一段经历存入发起方的 Episodic，并在发起方处境中追加 `recent_contacts`（保留最近 10 条）
 
 执行成功后任务**从 `pending_tasks` 移除**，内容和向量转入 `recent_done`（只用于去重，超出窗口自动清理），完整任务记录写入 `todo` 生命事件（action=completed），并记录 `task_execution` 事件。服务启动时会把旧版本遗留在 `pending_tasks` 中的已完成/已取消任务迁移出去（幂等）。
 
 ---
+
+## 主动触达
+
+实现：`app/service/outreach_service.py`。agent 主动开口说话的两种来源：
+
+- **任务完成**：替某人做的联网任务查完后（`notify_task_done`），告诉委托人查到了什么；社交任务（`interaction_type = dialogue`）执行时主动联系任务里的那个人
+- **念头**：Thought Generator 定时生成的念头带有 `target_person`（生成时只能从关系表里的人名中选）。`maybe_express_thought` 用一次 System One 判断此刻要不要说给对方听，输入是"我是谁"（`persona_system1`）、对方是谁、最近的对话和这个念头；yes 概率 ≥ 0.6 才说。要不要说由人格决定，刚说过类似的话也会被判为不说
+
+**投递**（`deliver`）按关系表里对方的 kind 决定，不靠名字推测：
+
+| 对方 | 方式 |
+|---|---|
+| kind = human | 写入发件箱 `outbox:{agent_id}:{人名}`，前端调用 `GET /brain/fetch_talk?agent_id=&human=` 取走（取走即删除） |
+| kind = agent | 用关系里记录的 agent_id 调用对方的 react，说话人用对方关系表里对"我"的称呼（对方没有记录时用"我"的 agent_id）；对方的回复写入"我"的工作记忆 |
+| 不在关系表里 | 不主动联系（陌生人），任务取消，也不会以人名为 agent_id 创建游离数据 |
+
+说出口的话由 System3 生成（按说话习惯，说话人是对方，"此刻对方说"是"对方没有说话，这是我主动开口"），然后写入"我"的工作记忆，标注"（主动找某人说）"，之后的对话知道自己说过；同时记录 `proactive_talk` 生命事件。
+
+### 反思（Reflection Worker）
+
+实现：`app/worker/reflection_worker.py`。把经历沉淀成信念，模拟人在睡眠中的记忆重放与巩固。**Brief 只由初始化和这里写入。**
+
+每天跑一次（`REFLECTION_WORKER_RUN_HOUR`，默认 04:00，本地时间）；跑完把时间记进 Redis，当天不会重复跑，服务重启也不会额外触发。
+
+**候选**：Episodic 中 `updated_at != created_at`（被重新提起过；重激活时会更新 `updated_at`）且 24 小时内更新过的记忆。事实型（`gate_type = SEMANTIC`）必选；`importance ≥ 3` 的经历按 `REFLECTION_INCLUDE_HIGH_IMPORTANCE` 纳入；`type = task_completion` 的系统回执排除。按重要性排序取前 `REFLECTION_MAX_CANDIDATES`（30）条。
+
+**判断**：一次 LLM 调用，输入是人格片段（`persona_system1`）、全部现有 Brief、候选经历（带编号）。提示词见 `REFLECTION_PROMPT`，按七条标准逐条判定：归属（别人的话不是信念）、稳定性（一次性事件不是信念）、独立性、可检验性、不重复、不越界（个人事实归 profile）、不反噬（不把别人的指责照搬成对自己的判断）。输出 JSON：`{memory_ids, kind, action, target_index, text, reason, confidence}`。
+
+**写回（有界步长）**：每个 agent 每轮最多 `REFLECTION_MAX_ACTIONS`（2）条；`confidence < REFLECTION_MIN_CONFIDENCE`（0.75）不写；`add` 前先查重（与本轮已写的文本比，并用 Brief 检索现有信念，rerank ≥ 0.85 视为同一件事），避免反思模型写出"多一个限定词"的近似条目；`revise` / `merge` 不删除旧条目，只给它写 `superseded_by`，检索时忽略但保留历史（可回滚、可解释）。每条反射信念带 `source: reflection`、`evidence_ids`、`confidence`、`reason`，并记一条 `thought_type = reflection` 的生命事件。
 
 ## 后台 Worker
 
@@ -545,6 +634,7 @@ LLM 失败时不做任何清理，数据留到下一次。当日摘要只留在�
 | `situation` | 处境被设置或更新 |
 | `emotion` | 整体状态变化（含前后值和增量） |
 | `task_execution` | 待办执行成功或失败 |
+| `proactive_talk` | 主动对某人说的话（任务完成的通知、想说出口的念头），含投递方式 outbox / react |
 
 LLM token 用量通过 `contextvars` 收集：`react()` 开始时调用 `start_usage_collection()`，同一上下文中的 `chat` 调用都会把用量追加进来。
 
@@ -556,18 +646,19 @@ LLM token 用量通过 `contextvars` 收集：`react()` 开始时调用 `start_u
 
 | 接口 | 行为 |
 |---|---|
-| `POST /admin/initialize_agent` | 一次性写入人格、Brief/Episodic/Knowledge、人际关系、处境、整体状态、念头、待办。用 Redis 锁防止并发重复初始化；agent 在 Redis 或 Qdrant 中已有任何数据时返回 409。**只有同时提供 system1 和 system2 时才会写入人格** |
+| `POST /admin/initialize_agent` | 一次性写入人格、Brief/Episodic/Knowledge、人际关系、处境、整体状态、念头、待办。用 Redis 锁防止并发重复初始化；agent 在 Redis 或 Qdrant 中已有任何数据时返回 409。**只有同时提供 system1 和 system2 时才会写入人格**。`capabilities` 设置能力（目前只有 `web_search`），不传即没有任何能力 |
 | `GET /admin/agents` | persona（`persona:*:system1`）与 subject_context 的 agent 取并集 |
 | `GET /admin/agent/{agent_id}` | 按初始化接口的结构返回完整信息 |
-| `PUT /admin/agent/{agent_id}` | 覆盖式更新，只更新传了的字段。situation / overall_state / thoughts / pending_tasks 整体替换（pending_tasks 中 status 不是 pending 的会被忽略）；relationships 先清空再写入（传 `[]` 即清空）。agent 不存在返回 404 |
+| `PUT /admin/agent/{agent_id}` | 覆盖式更新，只更新传了的字段。situation / overall_state / thoughts / pending_tasks 整体替换（pending_tasks 中 status 不是 pending 的会被忽略）；relationships 先清空再写入（传 `[]` 即清空）；capabilities 整体替换（传 `[]` 即关闭全部能力）。agent 不存在返回 404 |
 | `POST /admin/agent/{agent_id}/memories` | 追加 Brief / Episodic / Knowledge，每条都作为新记录写入。agent 不存在返回 404 |
 | `DELETE /admin/agent/{agent_id}/pfc` | 删除 `stm` 和 `stm:compress` |
-| `GET /admin/config` | 返回 35 个可调参数的名称、当前值、默认值、类型、描述、取值范围 |
+| `GET /brain/fetch_talk` | 参数 `agent_id`、`human`：取走 agent 主动想对这个人说的话，取走即删除，见[主动触达](#主动触达) |
+| `GET /admin/config` | 返回 36 个可调参数的名称、当前值、默认值、类型、描述、取值范围 |
 | `PUT /admin/config` | 修改参数，见下文 |
 
 ### 运行时配置
 
-- 白名单在 `app/config/runtime_config.py`，包括 Brief/Episodic 检索、记忆衰减、工作记忆、react 路由与知识注入、System2/3 温度和最大 token、记忆重激活阈值、待办去重、路由兜底、System1 最近对话条数等 35 项。这些参数在代码中都是调用时读取 `settings.X`，修改后下一次使用即生效
+- 白名单在 `app/config/runtime_config.py`，包括 Brief/Episodic 检索、记忆衰减、工作记忆、react 路由与知识召回和注入、System2/3 温度和最大 token、记忆重激活阈值、待办去重、路由兜底、System1 最近对话条数等 36 项。这些参数在代码中都是调用时读取 `settings.X`，修改后下一次使用即生效
 - 修改流程：整体校验（白名单、严格类型、取值范围，以及 `PFC_STM_COMPRESS_COUNT ≤ PFC_STM_MAX_LEN`），任意一项不合法则全部不改；校验通过后**先写回 `.env`**（临时文件 + 原子替换，保留其他行和注释），**再修改内存**中的 `settings`
 - 配置优先级：环境变量 > `.env` > `settings.py` 默认值。`settings` 设置了 `extra="forbid"`，`.env` 中出现未定义的配置项时服务无法启动
 
@@ -596,7 +687,8 @@ mem0 内部的 LLM 被替换为关闭深度思考的 `DoubaoLLM`，但由于写�
 - **念头不参与对话**：念头不进入任何 prompt；Thought Generator 生成的念头只用于产生待办，不保存
 - **Memory Gate 只看对方的话**："我"说过的话（包括承诺和谎言）只留在工作记忆里，不会进入长期记忆
 - **整体状态取值范围不一致**：初始化 / 更新接口要求 `mood` 在 [0, 1]，对话中的调整允许 [-1, 1]
-- Knowledge 的召回条数（5）和相似度阈值（0.5）写在代码里，不在配置中
+- Knowledge 的召回条数（5）写在代码里，不在配置中
+- Knowledge 的 rerank 阈值是在一个 17 条、单一主题的知识库上标定的，两侧余量都不大（0.484 / 0.529）；知识库规模和主题变化后需要重新验证
 - `/admin` 接口没有鉴权
 
 ---

@@ -19,12 +19,13 @@ This document describes the core flow and implementation details of CyberBrain. 
 11. [Memory Gate](#memory-gate)
 12. [Subjectivity: The 3F Model](#subjectivity-the-3f-model)
 13. [To-dos and Autonomous Behavior](#to-dos-and-autonomous-behavior)
-14. [Background Workers](#background-workers)
-15. [Life Events](#life-events)
-16. [Admin API and Runtime Configuration](#admin-api-and-runtime-configuration)
-17. [Model Calls at a Glance](#model-calls-at-a-glance)
-18. [Known Issues and Limitations](#known-issues-and-limitations)
-19. [Theoretical References](#theoretical-references)
+14. [Proactive Outreach](#proactive-outreach)
+15. [Background Workers](#background-workers)
+16. [Life Events](#life-events)
+17. [Admin API and Runtime Configuration](#admin-api-and-runtime-configuration)
+18. [Model Calls at a Glance](#model-calls-at-a-glance)
+19. [Known Issues and Limitations](#known-issues-and-limitations)
+20. [Theoretical References](#theoretical-references)
 
 ---
 
@@ -78,7 +79,9 @@ On the network side, `app/common/httpx_patch.py` changes the default `trust_env`
 | `persona:{agent_id}:system2` | String | System2 persona fragment: identity, ability boundaries, metacognition, honesty tendency | Same as above |
 | `persona:{agent_id}:speaking_manner` | String | Speaking manner for System3 | Same as above |
 | `subject_context:{agent_id}` | String (JSON) | Subject context: `situation`, `overall_state`, `thoughts`, `pending_tasks` (only tasks still to be executed), `recent_done` (recently completed/cancelled tasks, used for dedup), `last_update`. **Every write resets the expiry to 30 days** | Subjectivity service |
-| `agent:{agent_id}:relationships` | Hash | Field is a person's name; value is `"关系类型，描述"` ("relationship type, description") | Init / update API, daily consolidation |
+| `agent:{agent_id}:relationships` | Hash | Field is a person's name; value is JSON `{kind, agent_id, relationship, description}`; the legacy format `"关系类型，描述"` ("relationship type, description") is read as kind=human | Init / update API, daily consolidation |
+| `agent:{agent_id}:capabilities` | Set | The agent's capabilities, currently only `web_search`; missing means no capabilities | Init / update API |
+| `outbox:{agent_id}:{name}` | List | What the agent proactively wants to say to this person (kind=human), at most 50 kept; `GET /brain/fetch_talk` takes them out and deletes them | Proactive outreach |
 | `wm:{agent_id}:stm` | List | Raw working memory entries, one JSON per entry: `{type: "raw", role, speaker, content, lies?}` | react |
 | `wm:{agent_id}:stm:compress` | List | Compressed blocks or daily summaries: `{type: "compress" \| "daily", summary, speakers, count?}` | Rolling compression, daily consolidation |
 | `subject_context:{agent_id}:tasks_lock` | String | Lock for read-modify-write of to-dos (expires in 10 seconds) | Subjectivity service |
@@ -127,24 +130,25 @@ Record react_input event
   ├─ Compute the query vector once (cached, shared by all three retrievals)
   │
   ├─ In parallel:
-  │    ├─ Episodic retrieval (separate task; cancelled on the fast route)
-  │    ├─ Brief retrieval ──▶ System1
-  │    └─ Knowledge prefetch
+  │    ├─ Episodic retrieval (separate task, parallel with System1; awaited before routing)
+  │    ├─ Brief retrieval
+  │    └─ Knowledge prefetch (cosine filter + rerank)
+  ├─ System1 (sees Brief and "the material I have on this topic")
   │
-  ├─ Decide whether to use knowledge → choose the cognitive route
-  │    ├─ fast: cancel Episodic, intuitive plan
-  │    ├─ memory: wait for Episodic, intuitive plan + recalled past events + knowledge
-  │    └─ deliberate: wait for Episodic → System2 → decision plan
+  ├─ Decide whether to use knowledge and whether a past event was evoked
+  │    (highest Episodic score) → choose the cognitive route
+  │    ├─ fast: no Episodic, intuitive plan
+  │    ├─ memory: intuitive plan + recalled past events + knowledge
+  │    └─ deliberate: System2 → decision plan
   │                   (falls back to the intuitive plan on failure)
   │
   ├─ System3 produces the spoken words (skipped if System2 decides not to speak)
   ├─ Parse [谎言] markers; write "my" reply (or "（没有接话）") into working memory
   │
-  ├─ Synchronous (done before returning):
-  │    ├─ Memory Gate: evaluate and persist what the other person said
-  │    └─ Record react_output event (with the full trace)
+  ├─ Synchronous (done before returning): record react_output event (with the full trace)
   │
-  ├─ Asynchronous (does not block the return): check whether this turn produced a to-do;
+  ├─ Asynchronous (does not block the return): Memory Gate evaluates and persists what the
+  │    other person said; check whether this turn produced a to-do;
   │    adjust the overall state based on emotion; possibly generate a thought
   └─ Return
 ```
@@ -175,7 +179,7 @@ Query vector cache: `embedding_client.embed_query()` has a 512-entry LRU cache (
 
 Implementation: `app/service/system1_tev1.py`. It calls the **System One decision API** of Volcano Engine Ark (`doubao_client.decide()`, with the request header `ark-beta-systemone-api: true`, default model `DOUBAO_MODEL_LITE`). It does not generate text. Instead it makes a choice or gives a score for a set of questions, and returns probabilities.
 
-**Input context** (concatenated in this order): who the other person is → subject context (overall state + situation) → System1 persona fragment → Brief memories → the recent conversation (the last `BRAIN_SYSTEM1_RECENT_TURNS` raw entries of working memory, default 4, excluding the current sentence and compressed summaries) → the external signal (the speaker is labeled again right before the signal, because a small model gives more weight to content right next to the signal).
+**Input context** (concatenated in this order): who the other person is → subject context (overall state + situation) → System1 persona fragment → Brief memories → the material I have on this topic (titles of knowledge that survived rerank, or "no material directly on this topic") → the recent conversation (the last `BRAIN_SYSTEM1_RECENT_TURNS` raw entries of working memory, default 4, excluding the current sentence and compressed summaries) → the external signal (the speaker is labeled again right before the signal, because a small model gives more weight to content right next to the signal).
 
 System1 gets the recent conversation because the meaning of elliptical replies like "需要" ("yes, I need it"), "好的" ("okay") or "不用了" ("no need") lies entirely in the previous sentence. Given only two isolated characters, System1 can only guess.
 
@@ -191,7 +195,7 @@ System1 gets the recent conversation because the meaning of elliptical replies l
 | `conflict` | score | How much the topic conflicts with "my" values, expertise and the things "I" care about |
 | `requires_knowledge` | noul | Whether domain knowledge is needed |
 | `user_intent` | choice | 14 intents of the other person: 寒暄问候 (greeting / small talk), 闲聊 (chatting), 开玩笑 (joking), 分享近况 (sharing recent news), 提问 (asking a question), 求助 (asking for help), 征求意见 (asking for advice), 倾诉 (venting / confiding), 邀约 (inviting), 批评质疑 (criticizing / questioning), 挑衅冒犯 (provoking / offending), 提起往事 (bringing up the past), 正常讨论观点 (discussing views normally), 其他 (other) |
-| `quick_action` | choice | 12 intuitive actions: 随口接话 (reply casually), 调侃回去 (tease back), 反问对方 (ask back), 敷衍应付 (brush off), 关心对方 (show concern), 爽快答应 (agree readily), 直接拒绝 (refuse outright), 顶回去 (push back), 简单回答 (answer briefly), 岔开话题 (change the subject), 愣住或追问 (be taken aback or ask for more), 得想一想 (need to think it over) |
+| `quick_action` | choice | 13 intuitive actions: 随口接话 (reply casually), 调侃回去 (tease back), 反问对方 (ask back), 敷衍应付 (brush off), 关心对方 (show concern), 爽快答应 (agree readily), 直接拒绝 (refuse outright), 顶回去 (push back), 简单回答 (answer briefly), 岔开话题 (change the subject), 愣住或追问 (be taken aback or ask for more), 凭印象说 (answer from vague impression), 得想一想 (need to think it over). When asked about something it doesn't know, it reacts according to its persona |
 | `needs_memory` | noul | Whether a specific past event must be recalled to reply |
 | `needs_reasoning` | noul | Whether "I" need to stop and think carefully |
 
@@ -218,14 +222,22 @@ On failure, a neutral result is returned: 平静, intensity 0, `think_prob = 1.0
 | 4 | `action_confidence` < `BRAIN_ROUTE_MIN_ACTION_CONFIDENCE` (0.55) | deliberate | `low_action_confidence` |
 | 5 | Knowledge is used | memory | `knowledge` |
 | 6 | `needs_memory` ≥ `BRAIN_ROUTE_MEMORY_THRESHOLD` (0.6) | memory | `needs_memory` |
-| 7 | None of the above | fast | `intuitive` |
+| 7 | The highest rerank score among the Episodic memories retrieved in parallel ≥ `BRAIN_EPISODIC_CUE_MIN_SCORE` (0.75) | memory | `episodic_cue` |
+| 8 | None of the above | fast | `intuitive` |
 
 - Rule 3: if System1 picks a refusal toward someone "I" know, but the topic has almost no conflict, System1 has most likely misunderstood. System2 reviews it. A refusal toward a stranger, or a refusal when conflict really is high, is still carried out as intuited
 - Rule 4: when the intuitive action's probability is spread out (several options are about equal), the choice is close to random and should not turn directly into a reply
 - A knowledge hit does not force System2, but the route is at least memory, so related experiences are recalled too.
-- The fast route does not wait for Episodic retrieval; it cancels that task.
+- Either rule 6 or rule 7 is enough to bring memories in. `needs_memory` is a single yes/no judgment by a small model and is quite unstable: for the same sentence 我之前跟你说要去哪儿开民宿来着？ ("where did I say I'd open a guesthouse?") with identical input, two runs gave 0.47 and 0.05, and rewording the question only changes the kind of instability. Past events are usually brought back by what the other person says: Episodic retrieval already runs in parallel with System1, and if it finds a memory highly relevant to the sentence, it should be recalled, just as knowledge is used whenever something survives rerank. Measured (rerank scores): sentences that need recalling the past scored 0.81–0.98; those that don't scored 0–0.66, the highest being the reading experience evoked by 你觉得《百年孤独》好看吗 ("do you like One Hundred Years of Solitude?", 0.66), which is the kind of personal experience a topic should bring back anyway
+- Episodic retrieval is awaited before routing, since rule 7 depends on it. It runs in parallel with System1 and was measured to always finish first (150–230 ms vs about 370–720 ms for System1), so it usually costs nothing extra; the wait is recorded as `episodic_wait`. On the fast route the retrieved memories are not put into the plan. The trace's `recall.episodic_cue` records the highest score of the turn
 
-**Whether to use knowledge:** System1 judges that knowledge is needed, or the top prefetch score ≥ `BRAIN_KNOWLEDGE_SCORE_THRESHOLD` (0.5). When used, the top `BRAIN_KNOWLEDGE_INJECT_TOP_K` (2) entries are taken, and each body is truncated to `BRAIN_KNOWLEDGE_CONTENT_CHARS` (1200) characters. Because the prefetch's own similarity threshold is also 0.5, **in practice any prefetched knowledge gets used**.
+**Knowledge is injected with its confidence:** each entry's title carries a confidence label (high ≥ 0.75 / medium ≥ 0.5 / low, mostly commercial or marketing claims), in words rather than numbers. Both the System2 prompt and the intuitive plan state that content without high confidence may only be presented as "some sources say", never as a conclusion.
+
+**Whether to use knowledge:** this depends only on whether anything is left after rerank (see [Knowledge](#knowledge)). The remaining entries are sorted by rerank score, the top `BRAIN_KNOWLEDGE_INJECT_TOP_K` (2) are taken, and each body is truncated to `BRAIN_KNOWLEDGE_CONTENT_CHARS` (1200) characters.
+
+When System1 thinks knowledge is needed but nothing survives rerank, **and the other person is asking a question or for advice**, it is marked as a "knowledge gap" (when they are giving an instruction such as "go look up X", the request is what needs a response, so it is not a gap). The intuitive plan only states the fact, "the material I have says nothing directly about this", and does not prescribe a response.
+
+**How to behave when not knowing is decided by the persona**: saying "I don't know", answering from vague impressions, changing the subject, or turning the question back are all expressions of metacognition and differ from person to person. System1 runs after the knowledge prefetch, and its input includes "the material I have on this topic" (titles of the matched knowledge, or "no material directly on this topic"). Based on the persona, it picks an intuitive action (such as 简单回答 "simple answer", 凭印象说 "answer from impression", 岔开话题 "change the subject", 反问对方 "ask back"), and System3 carries it out. Metacognition belongs in the persona (`persona_system1` decides the first reaction, `persona_system2` decides judgment when deliberating), not in the speaking manner.
 
 **Intuitive plan (fast / memory routes):** generated by `_quick_plan()`. It contains the other person's intent, "my first reaction" and its explanation. On the memory route it adds up to 3 recalled past events (with the note "details not here are things I don't remember clearly") and the matched knowledge. When the other person is asking a question, it requires answering directly first and then asking back. It always includes this reminder: things not actually done (who was contacted, what was sent, what was arranged) must not be described as done; "I" can only say "I" plan to do them, or ask whether the other person wants them done. The fast / memory routes have no System2 fact check, so this constraint can only live in the plan.
 
@@ -266,7 +278,9 @@ After successful parsing, the decision is formatted into a behavior plan for Sys
 
 Implementation: `cyber_brain._system3()`, model `DOUBAO_MODEL_CHARACTER`, temperature `BRAIN_SYSTEM3_TEMPERATURE` (0.5), max tokens `BRAIN_SYSTEM3_MAX_TOKENS` (1000).
 
-**It is deliberately given little information:** speaking manner (`speaking_manner`), who the other person is, overall state (without the situation), working memory, what the other person just said, the instinctive reaction (in words), and the behavior plan. **It is not given Brief, Episodic, knowledge or the situation**: any facts to be said are already in the plan, and giving more only makes it fill in content by itself.
+**It is deliberately given little information:** the instinctive self-knowledge (`persona_system1`, labeled "for holding identity and tone, not content to be said"), speaking manner (`speaking_manner`), who the other person is, overall state (without the situation), working memory, what the other person just said, the instinctive reaction (in words), and the behavior plan. **It is not given Brief, Episodic, knowledge or the situation**: any facts to be said are already in the plan, and giving more only makes it fill in content by itself.
+
+Why self-knowledge is included: knowing who you are is as instinctive as knowing who you're talking to (speaker info), so it should be present every turn, not only when System2 runs. Otherwise, asked "who are you / what can you do" on the fast route, System3 doesn't know who it is and can only fall back on phrasings from the speaking manner.
 
 The prompt (`SYSTEM3_PROMPT`) requires it to: follow the plan faithfully; express only outward-facing content; use natural spoken language; let the plan decide the length; add no specific people, places, numbers or experiences; never claim to have completed an action that the plan does not state as completed (such as "I've already contacted them for you"); use no bracketed stage directions; use the other person's language; and append `[谎言]` only to the end of the lies the plan specifies.
 
@@ -341,13 +355,20 @@ Brief is used only by System1 and System2.
 `knowledge_memory_service` reads and writes Qdrant directly through `GenericQdrantClient`:
 
 - Types: `concept`, `howto`, `best_practice`, `troubleshooting`, `example`; sources: `experience`, `learning`, `project`, `documentation`. Invalid values are replaced with defaults
-- Retrieval: dense vectors, filtered by `agent_id`, 5 entries, similarity threshold 0.5 (these two values are currently hard-coded, not in the configuration)
+- Retrieval has two steps:
+  1. Dense vector recall, filtered by `agent_id`, 5 entries, cosine ≥ `BRAIN_KNOWLEDGE_SCORE_THRESHOLD` (0.5)
+  2. `qwen3-rerank` judges whether each entry answers the sentence; entries below `BRAIN_KNOWLEDGE_RERANK_MIN_SCORE` (0.5) are dropped
+
+  Cosine alone cannot tell "on the same topic" from "answers the question": with a single-topic knowledge base, any question on that topic recalls entries above 0.55. Measured on 17 anti-aging entries: for questions the base cannot answer (NAD+, metformin, fasting, etc.), the highest rerank score of recalled entries was 0.484; for questions it can answer, the lowest score of the correct entry was 0.529. If the rerank call fails, only entries with cosine ≥ 0.6 are kept
+- The recall count (5) is still hard-coded, not in the configuration
 - Prefetched on every react turn; for whether it is injected, see [Cognitive Route Selection](#cognitive-route-selection)
 - Write sources: the init API and the add-memories API. Memory Gate does not write Knowledge
 
 ### Relationships
 
-A Redis Hash with exact name matching only, used for [Speaker Identification](#speaker-identification). Write sources: the init / update API, and new strangers recorded automatically during daily consolidation.
+A Redis Hash with exact name matching only, used for [Speaker Identification](#speaker-identification). Write sources: the init / update API, and new strangers recorded automatically during daily consolidation (kind=human).
+
+Each relationship records the other party's **type**: `kind = human` (a real person) or `agent` (another agent, in which case its `agent_id` is required). The type only decides [how "I" reach out to them](#proactive-outreach) and does not go into prompts; the relationship description in prompts is still "relationship type, description". Validation happens both in the API model and in the storage layer: kind=agent requires agent_id, kind=human must not have one.
 
 ### Working memory (PFC)
 
@@ -364,7 +385,7 @@ Working memory goes into System2 and System3, and is also used for speaker ident
 
 ## Memory Gate
 
-Implementation: `memory_gate_service.evaluate_and_persist()`. It runs before each react turn returns and **evaluates only what the other person said** (the signal), not "my" reply. Evaluation runs in parallel with Episodic [reactivation](#episodic-episodic-memory).
+Implementation: `memory_gate_service.evaluate_and_persist()`. It runs in the background after each react turn has produced its reply, without blocking the return (it only affects later recall; the next turn relies on the raw text in working memory, not on this write), and **evaluates only what the other person said** (the signal), not "my" reply. Evaluation runs in parallel with Episodic [reactivation](#episodic-episodic-memory).
 
 **Evaluation:** one System One request asks two questions:
 
@@ -382,12 +403,24 @@ If evaluation fails, it is treated as importance = 2, SEMANTIC.
 
 | Condition | Handling |
 |---|---|
-| importance = 0 | Drop |
-| EPISODIC and importance < 3 | Not written to long-term memory (stays only in working memory) |
-| EPISODIC and importance ≥ 3 | Write to Episodic |
-| SEMANTIC and importance ≥ 1 | Write to Brief |
+| importance < 3 | Not written to long-term memory (stays only in working memory) |
+| importance ≥ 3 (whether judged EPISODIC or SEMANTIC) | Write to Episodic, with `gate_type` kept in the metadata |
+| Contains stable personal information about the speaker (see below) | Merged into that person's profile in the relationship table |
 
-When the speaker is not `user` / `self`, the stored content is "{说话人}对我说：{原话}" ("{speaker} said to me: {original words}"), so the speaker is not lost. The metadata includes `speaker`, `importance`, `source: memory_gate` and `timestamp`.
+**A conversation never writes to Brief directly.** Brief is "my beliefs" (judgments about myself); what a conversation contains is "what the other person said". A weighty sentence lands as an experience, and only reflection (see [Reflection](#reflection-reflection-worker)) can turn it into a belief about myself. Casting it straight into a belief would decide for the agent how it should be affected, and Brief does not decay, is not reactivated, and has no delete API. Brief is therefore written only by initialization and by reflection.
+
+When the speaker is not `user` / `self`, the stored content is "{说话人}对我说：{原话}" ("{speaker} said to me: {original words}"), so the speaker is not lost. The metadata includes `speaker`, `importance`, `gate_type`, `source: memory_gate` and `timestamp`.
+
+**Personal information (profile):** evaluation also asks `person_fact` (did the speaker volunteer stable information about themselves?). At a probability ≥ 0.6, one LLM call extracts it into controlled slots (name, address, occupation, household, allergies… 16 in all, see `PROFILE_SLOTS`), and it is merged into that person's `profile` in the relationship table. The rules:
+
+- **Strangers are ignored**: personal information from someone not in the relationship table is not recorded (a passer-by who announces their life story gets heard, but not diligently memorized)
+- **Dedup**: the same slot with the same value only bumps `mentions` and `last_confirmed_at`, adding no entry
+- **Overwrite**: for single-value slots (address, occupation…) the new value takes effect and the old one moves into `history` (at most 2), so "he used to live in Beijing" is still answerable
+- **List slots** (household, allergies, long-term preferences, taboos, habits, important dates): no duplicate values, at most 8
+- **The relationship is never overwritten**: `relationship` / `description` are untouched, and updating a relationship without passing profile keeps what has been gathered
+- It lives in the value of the same Hash as the relationship description (`agent:{agent_id}:relationships`), with no extra key
+
+When read, it goes to System1/2/3 together with the speaker description: `我对{人名}的了解（对方自己说过的，不是我自己的事）：- 住址：上海……`, kept clearly apart from "my beliefs".
 
 **Updating the situation after writing:** another System One request decides whether this information requires updating the situation. If so, `SITUATION_UPDATE_PROMPT` has the LLM output a new, complete situation JSON, which replaces the old one as a whole via `replace_situation()`. Each event in the new situation that is due within 3 days adds +0.1 to stress. If no update is needed, an overall state adjustment is still called once (with zero delta, which amounts to recomputing energy from the current stress).
 
@@ -448,27 +481,47 @@ The example values in this JSON mean: 准备游戏上线 ("preparing the game la
 
 ## To-dos and Autonomous Behavior
 
+### Capabilities
+
+Web search is a very concrete mechanism: something "I" agreed to look up comes back seconds later as a sourced summary, written into the knowledge base, followed by a proactive notice. That suits a personal knowledge base assistant but not a human-like character: a friend who says "I'll look it up later" and returns a structured list half a minute later no longer feels human, and the knowledge base fills up with search snippets.
+
+So whether an agent can search the web is an **agent-level capability switch** (`agent:{agent_id}:capabilities`). It is not written into the persona or left to a prompt to decide: it is whether the agent objectively has this tool, not a personality trait. It is set through `capabilities` in `initialize_agent` / `PUT /admin/agent`, and **by default an agent has no capabilities**.
+
+| | With `web_search` | Without (default) |
+|---|---|---|
+| Conversation / thought funnel | Asks `needs_web_search` (the conversation funnel also asks `execute_now`) | Not asked; both are false on the task, and the System One request has two fewer questions |
+| Immediate execution | Web tasks run right after being written | Not run immediately |
+| Execution | Web search → written to Knowledge → requester notified | Runs as a normal task, no web access |
+
+Without the web capability, "I'll look it up for you later" is still an ordinary to-do, executed as a normal task when its time comes.
+
 ### Creating to-dos (`add_todo`)
 
-**From conversations** (run in the background at the end of each react turn, without blocking the return):
+**From conversations** (run in the background at the end of each react turn, without blocking the return). Both the judgment and the extraction see the recent turns (the same ones System1 sees): in confirmations like "look it up" or "OK, go ahead" the content is all in the previous turn, so looking at the current sentence alone loses what is to be done:
 
-1. System One makes a rough judgment on two things:
+1. One System One request judges the following (the last two are asked only when the agent has the `web_search` capability, see [Capabilities](#capabilities)):
    - `has_commitment`: the other person explicitly asked for some action, and "I" explicitly agreed
    - `needs_interaction`: whether completing the task requires talking to someone
-2. When `has_commitment = yes` with confidence > 0.5, the lite model (`DOUBAO_MODEL_LITE`, temperature 0, at most 80 tokens) does three things in one call:
-   - Re-check whether "I" really agreed to do something; if not, output only 无 ("none")
+   - `needs_web_search`: whether completing the task requires searching the web for information "I" don't have yet
+   - `execute_now`: whether to start right now (the other person asks for it now, or no time is given and it can be started immediately); a later time, a condition to wait for, or a reminder for later all count as no
+2. When the yes probability of `has_commitment` is ≥ 0.85, the lite model (`DOUBAO_MODEL_LITE`, temperature 0, at most 80 tokens) does two things in one call (it no longer re-checks whether there is a task: on the same input it wrongly answered 无 "none" about 1 time in 4):
    - Turn the other person's words into a task description (at most 30 characters, not copying the original words)
    - Work out the deadline (`YYYY-MM-DD`) from any time mentioned. The prompt includes today's date and weekday, so expressions like 明早 ("tomorrow morning"), 下周三 ("next Wednesday") and 月底 ("end of the month") can all be resolved. If no time is mentioned, it is left empty
 
    The prompt is about 150 tokens, and the output is one or two lines of plain text (not JSON). Measured at about 1 second per call
 3. If it passes, the task is created with priority 0.8, and the related person is the speaker
 
-When talking to someone is needed, the task carries `interaction_type: "dialogue"`.
+When talking to someone is needed, the task carries `interaction_type: "dialogue"`; when web search is needed, `needs_web_search: true`; when it should be done now, `execute_now: true`.
 
-**From thoughts** (Thought Generator Worker):
+**Immediate execution:** the to-do is written as usual (dedup still applies). If `execute_now = true`, it is a **web search task** and the agent has the `web_search` capability, `cyber_brain` immediately calls `task_executor.run_task()` without waiting for the Task Reminder schedule; on success it is removed from the to-dos, on failure it stays and the worker retries at the next check. Only web search tasks are allowed because:
+- "Executing" an ordinary task means the LLM invents a one-sentence result; doing it immediately would put something that never happened into the very next turn
+- A social task created from conversation always targets the current speaker (the person already talking to "me"), so "reaching out" right away makes no sense
 
-1. If the thought contains action keywords (得 (have to), 要 (need to), 应该 (should), 找 (look for), 联系 (contact), 问 (ask), 准备 (prepare), 安排 (arrange), 约 (make an appointment), etc.) → create directly, with the full thought as content and priority 0.6
-2. Otherwise, ask System One whether it should become a to-do: confidence > 0.7 creates it directly; 0.5–0.7 lets the LLM decide
+`run_task()` keeps an in-process set of running tasks, so immediate execution and the worker's check never run the same task twice.
+
+**From thoughts** (Thought Generator Worker): one System One request judges both `need_task` (is there something concrete "I" want to do, including wanting to find out, verify or fill in some piece of knowledge) and `needs_web_search` (asked only with the `web_search` capability). If the yes probability of `need_task` is ≥ 0.8, the to-do is created directly (its priority is that probability); 0.6–0.8 lets the LLM confirm; anything lower is not created.
+
+> The judgment uses `probabilities["yes"]` from System One, not `confidence`. The latter measures how certain the judgment is (about 1 − entropy): with a yes probability of 0.755, `confidence` is only 0.197, so it cannot be used as "the probability of yes".
 
 **Storage and dedup:**
 
@@ -499,12 +552,51 @@ A hash of the task ID is used instead of a random number, so every check of the 
 
 **How tasks are executed:**
 
-- **Ordinary tasks**: the LLM simulates a one-sentence result in the first person, which is written to Episodic as "[自主完成] …" ("[done on my own] …"). Learning tasks (containing words like 学习 (study), 了解 (learn about), 研究 (research)) are also written to Knowledge if possible. Then the LLM decides whether to update the situation (current activity / event completed / new ongoing state)
-- **Social tasks** (`interaction_type = dialogue`): the LLM generates an opening line of at most 15 characters and calls `react()` of the **target agent** (`related_person` is used as the target agent_id), with the initiator as the speaker. Both sides' words are written as one experience into the initiator's Episodic, and `recent_contacts` is appended to the initiator's situation (keeping the 10 most recent)
+`execute_task` checks in this order, web search first (the decision model often also marks "look it up and add it to the knowledge base" as needing contact, but the substance of such a task is getting information):
+
+- **Web search tasks** (`needs_web_search = true` and the agent has the `web_search` capability; the capability is checked again at execution and tasks without it run as normal tasks. Web tasks created before the switch was turned off, or written directly through the API, skip the funnel and are caught here):
+  1. The LLM rewrites the to-do into **two** queries: one about the thing itself, and one about its risks, limitations, counter-evidence or controversy. The two Tavily searches run in parallel (`app/client/web_search_client.py`, `WEB_SEARCH_MAX_RESULTS` results each) and are merged and deduplicated by URL. With a single search, the knowledge leans whichever way the results happen to lean
+  2. Searches prefer the sites in `WEB_SEARCH_PREFER_DOMAINS` (journals, PubMed, health authorities, etc.; Tavily's `prefer` mode only prioritizes them and still fills in from other sites)
+  3. The LLM first labels the **source type** of each result (学术研究 academic research / 官方或专家共识 official or expert consensus / 新闻媒体 news media / 商家或营销 commercial or marketing), then turns **only the excerpts** into 1–3 knowledge entries. The body must say which kind of source a claim comes from, include both sides when there is evidence on both, say when evidence comes only from animal or small-sample studies, never state commercial claims as conclusions, and mark citations with `[1][2]`
+  4. Each entry is written to Knowledge with confidence set by the **most reliable type** among its cited sources (academic research and official/expert consensus 0.75, news media 0.55, commercial or marketing 0.35); the title, type and link of each source are appended to the body, `source = learning`
+  5. One Episodic experience is written ("I searched the web for X and added to the knowledge base: …" or "… found nothing reliable"), with both queries and the source links in its metadata
+  
+  If `TAVILY_API_KEY` is not configured or the search fails, the task returns failure and **stays pending**, to be retried at the next check. No result is invented
+- **Ordinary tasks**: the LLM simulates a one-sentence result in the first person, which is written to Episodic as "[自主完成] …" ("[done on my own] …"). Then the LLM decides whether to update the situation (current activity / event completed / new ongoing state). Simulated results are no longer written to Knowledge
+- **Social tasks** (`interaction_type = dialogue`): first check that `related_person` is an existing agent (has a persona); if not, the task is **cancelled** (react is not called, so no stray data is created under a person's name, and the worker does not retry it forever). Once that passes, the LLM generates an opening line of at most 15 characters and calls `react()` of the **target agent** (`related_person` is used as the target agent_id), with the initiator as the speaker. Both sides' words are written as one experience into the initiator's Episodic, and `recent_contacts` is appended to the initiator's situation (keeping the 10 most recent)
 
 After successful execution, the task is **removed from `pending_tasks`**. Its content and vector move to `recent_done` (used only for dedup and cleaned up automatically once outside the window). The full task record is written to a `todo` life event (action=completed), and a `task_execution` event is recorded. At service startup, completed/cancelled tasks left in `pending_tasks` by older versions are migrated out (idempotent).
 
 ---
+
+## Proactive Outreach
+
+Implementation: `app/service/outreach_service.py`. Two sources of the agent speaking first:
+
+- **Task completed**: when a web task done on someone's behalf finishes (`notify_task_done`), tell the requester what was found; a social task (`interaction_type = dialogue`) reaches out to the person in the task
+- **Thoughts**: thoughts from the Thought Generator carry a `target_person` (chosen only from the names in the relationship table). `maybe_express_thought` makes one System One call on whether to say it now, given "who I am" (`persona_system1`), who the other person is, the recent conversation and the thought; it is said only if the yes probability is ≥ 0.6. Whether to speak is up to the persona, and having just said something similar also leads to "no"
+
+**Delivery** (`deliver`) is decided by the other party's kind in the relationship table, never guessed from the name:
+
+| Recipient | How |
+|---|---|
+| kind = human | Pushed to the outbox `outbox:{agent_id}:{name}`; the frontend calls `GET /brain/fetch_talk?agent_id=&human=` to take the messages (taking deletes them) |
+| kind = agent | Calls the other agent's react using the agent_id recorded in the relationship; the speaker is the name the other agent knows "me" by (or "my" agent_id if it has no record); the reply is written to "my" working memory |
+| Not in the relationship table | No outreach (a stranger); the task is cancelled, and no stray data is created under a person's name |
+
+The words are produced by System3 (with the speaking manner; the speaker is the recipient and "what they just said" is "they said nothing, I'm speaking first"), then written to "my" working memory marked "(reached out to someone)", so later conversations know it was said; a `proactive_talk` life event is also recorded.
+
+### Reflection (Reflection Worker)
+
+Implementation: `app/worker/reflection_worker.py`. It turns experiences into beliefs, modelling the replay and consolidation that happen during sleep. **Brief is written only by initialization and by this worker.**
+
+It runs once a day (`REFLECTION_WORKER_RUN_HOUR`, default 04:00 local time) and records the run time in Redis, so it does not run twice in a day, and a service restart does not trigger an extra run.
+
+**Candidates**: Episodic memories whose `updated_at != created_at` (they were mentioned again; reactivation updates `updated_at`) and were updated within the last 24 hours. Fact-type entries (`gate_type = SEMANTIC`) are always included; experiences with `importance ≥ 3` are included according to `REFLECTION_INCLUDE_HIGH_IMPORTANCE`; system receipts (`type = task_completion`) are excluded. Sorted by importance, the top `REFLECTION_MAX_CANDIDATES` (30) are taken.
+
+**Judgment**: one LLM call, given the persona fragment (`persona_system1`), every current Brief entry, and the candidate experiences (numbered). The prompt is `REFLECTION_PROMPT` and applies seven tests to each candidate: ownership (someone else's words are not a belief), stability (a one-off event is not a belief), independence, testability, non-duplication, non-transgression (personal facts belong in the profile), and non-self-harm (not copying someone's accusation into a judgment about oneself). The output is JSON: `{memory_ids, kind, action, target_index, text, reason, confidence}`.
+
+**Writing back (bounded step)**: at most `REFLECTION_MAX_ACTIONS` (2) entries per agent per round; anything with `confidence < REFLECTION_MIN_CONFIDENCE` (0.75) is dropped; before an `add` the text is checked for duplicates (against what was written this round, and against existing beliefs retrieved from Brief, with a rerank score ≥ 0.85 meaning the same thing), so the model cannot pile up near-identical variants that differ by one qualifier; `revise` / `merge` never delete the old entry, they only write `superseded_by` on it, which excludes it from retrieval while keeping the history (rollback and explanation stay possible). Every reflected belief carries `source: reflection`, `evidence_ids`, `confidence` and `reason`, and a `thought_type = reflection` life event is recorded.
 
 ## Background Workers
 
@@ -553,6 +645,7 @@ See [Subjectivity](#fabrication-thoughts) and [To-dos and Autonomous Behavior](#
 | `situation` | The situation is set or updated |
 | `emotion` | The overall state changes (with before/after values and the delta) |
 | `task_execution` | A to-do execution succeeds or fails |
+| `proactive_talk` | Something said proactively to someone (a task-done notice or a thought worth saying), with the delivery method outbox / react |
 
 LLM token usage is collected with `contextvars`: `react()` calls `start_usage_collection()` at the start, and every `chat` call in the same context appends its usage.
 
@@ -564,18 +657,19 @@ Query: `GET /admin/timeline/{agent_id}?event_types=react_input,react_output&page
 
 | Endpoint | Behavior |
 |---|---|
-| `POST /admin/initialize_agent` | Writes persona, Brief/Episodic/Knowledge, relationships, situation, overall state, thoughts and to-dos in one go. A Redis lock prevents concurrent duplicate initialization. Returns 409 if the agent already has any data in Redis or Qdrant. **The persona is written only when both system1 and system2 are provided** |
+| `POST /admin/initialize_agent` | Writes persona, Brief/Episodic/Knowledge, relationships, situation, overall state, thoughts and to-dos in one go. A Redis lock prevents concurrent duplicate initialization. Returns 409 if the agent already has any data in Redis or Qdrant. **The persona is written only when both system1 and system2 are provided**. `capabilities` sets the capabilities (currently only `web_search`); omitted means none |
 | `GET /admin/agents` | The union of agents from persona (`persona:*:system1`) and subject_context |
 | `GET /admin/agent/{agent_id}` | Returns full information in the same structure as the init API |
-| `PUT /admin/agent/{agent_id}` | Overwrite update; only the fields passed are updated. situation / overall_state / thoughts / pending_tasks are replaced as a whole (entries in pending_tasks whose status is not pending are ignored); relationships are cleared and then written (passing `[]` clears them). Returns 404 if the agent does not exist |
+| `PUT /admin/agent/{agent_id}` | Overwrite update; only the fields passed are updated. situation / overall_state / thoughts / pending_tasks are replaced as a whole (entries in pending_tasks whose status is not pending are ignored); relationships are cleared and then written (passing `[]` clears them); capabilities are replaced as a whole (passing `[]` turns all off). Returns 404 if the agent does not exist |
 | `POST /admin/agent/{agent_id}/memories` | Appends Brief / Episodic / Knowledge; each entry is written as a new record. Returns 404 if the agent does not exist |
 | `DELETE /admin/agent/{agent_id}/pfc` | Deletes `stm` and `stm:compress` |
-| `GET /admin/config` | Returns the name, current value, default value, type, description and value range of the 35 tunable parameters |
+| `GET /brain/fetch_talk` | Params `agent_id`, `human`: takes what the agent proactively wants to say to this person; taking deletes them. See [Proactive Outreach](#proactive-outreach) |
+| `GET /admin/config` | Returns the name, current value, default value, type, description and value range of the 36 tunable parameters |
 | `PUT /admin/config` | Changes parameters; see below |
 
 ### Runtime configuration
 
-- The whitelist is in `app/config/runtime_config.py`. It has 35 items, covering Brief/Episodic retrieval, memory decay, working memory, react routing and knowledge injection, System2/3 temperature and max tokens, the memory reactivation threshold, to-do dedup, routing fallbacks, the number of recent turns for System1, and more. The code reads all of these as `settings.X` at call time, so a change takes effect the next time the value is used
+- The whitelist is in `app/config/runtime_config.py`. It has 36 items, covering Brief/Episodic retrieval, memory decay, working memory, react routing and knowledge retrieval and injection, System2/3 temperature and max tokens, the memory reactivation threshold, to-do dedup, routing fallbacks, the number of recent turns for System1, and more. The code reads all of these as `settings.X` at call time, so a change takes effect the next time the value is used
 - Update flow: everything is validated as a whole (whitelist, strict types, value ranges, plus `PFC_STM_COMPRESS_COUNT ≤ PFC_STM_MAX_LEN`). If any item is invalid, nothing is changed. After validation passes, the values are **first written back to `.env`** (temp file + atomic replace, keeping other lines and comments), **then changed in memory** in `settings`
 - Configuration precedence: environment variables > `.env` > defaults in `settings.py`. `settings` uses `extra="forbid"`, so the service will not start if `.env` contains an undefined setting
 
@@ -604,7 +698,8 @@ The LLM inside mem0 is replaced with `DoubaoLLM` with deep thinking turned off. 
 - **Thoughts do not take part in conversations**: thoughts do not go into any prompt; thoughts from the Thought Generator are used only to create to-dos and are not saved
 - **Memory Gate only looks at the other person's words**: what "I" said (including promises and lies) stays only in working memory and never enters long-term memory
 - **Inconsistent overall state ranges**: the init / update API requires `mood` in [0, 1], while adjustments during conversation allow [-1, 1]
-- Knowledge's retrieval count (5) and similarity threshold (0.5) are hard-coded, not in the configuration
+- Knowledge's retrieval count (5) is hard-coded, not in the configuration
+- The Knowledge rerank threshold was calibrated on a 17-entry single-topic knowledge base, with little margin on either side (0.484 / 0.529); re-check it when the size or topics of the knowledge base change
 - The `/admin` API has no authentication
 
 ---

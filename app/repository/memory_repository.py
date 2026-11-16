@@ -355,6 +355,8 @@ class MemoryRepository:
                     if rr["relevance_score"] < settings.EPISODIC_RERANK_MIN_SCORE:
                         dropped += 1
                         continue
+                    if candidates[idx].get("superseded_by"):
+                        continue  # 已被反思修正/合并的旧信念，不再进入上下文
                     mem = candidates[idx].copy()
                     mem["rerank_score"] = rr["relevance_score"]
                     reranked.append(mem)
@@ -548,7 +550,8 @@ class MemoryRepository:
                 filtered = []
                 for rr in rerank_results:
                     idx = rr["index"]
-                    if idx < len(candidates) and rr["relevance_score"] >= settings.BRIEF_RERANK_MIN_SCORE:
+                    if (idx < len(candidates) and rr["relevance_score"] >= settings.BRIEF_RERANK_MIN_SCORE
+                            and not candidates[idx].get("superseded_by")):
                         mem = candidates[idx].copy()
                         mem["rerank_score"] = rr["relevance_score"]
                         filtered.append(mem)
@@ -722,6 +725,27 @@ class MemoryRepository:
             logger.error(f"Failed to update decay_weight for {memory_id}: {e}")
             return False
 
+    async def mark_superseded(self, memory_id: str, superseded_by: str, memory_type: str = "brief") -> bool:
+        """把一条记忆标记为"已被修正/合并"：检索时忽略，但保留在库里（可回滚、可解释）"""
+        if not self.enabled:
+            return False
+        client = self.brief_client if memory_type == "brief" else self.episodic_client
+        if not client:
+            return False
+        try:
+            await asyncio.to_thread(
+                lambda: client.vector_store.client.set_payload(
+                    collection_name=client.vector_store.collection_name,
+                    payload={"superseded_by": superseded_by,
+                             "superseded_at": datetime.utcnow().isoformat()},
+                    points=[memory_id],
+                )
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Failed to mark {memory_id} superseded: {e}")
+            return False
+
     async def delete(self, memory_id: str, memory_type: str = "episodic") -> bool:
         """删除单条记忆（用于低权重清理）"""
         if not self.enabled:
@@ -810,6 +834,8 @@ class MemoryRepository:
                         payload={
                             "decay_weight": 1.0,
                             "last_reactivated_at": datetime.utcnow().isoformat(),
+                            # updated_at 记"这条记忆最近被碰过"：反思 worker 用它筛出 24 小时内被重放过的记忆
+                            "updated_at": datetime.utcnow().isoformat(),
                         },
                         points=list(hit_ids),
                     )

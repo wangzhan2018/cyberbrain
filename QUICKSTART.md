@@ -38,6 +38,7 @@ CyberBrain 运行时依赖三个外部数据库服务和一组本地 SQLite 文�
 | `persona:{agent_id}:system1` / `:system2` / `:speaking_manner` | String | 人格画像三段 |
 | `subject_context:{agent_id}` | String（JSON，30 天过期） | 处境、整体状态、念头、待办 |
 | `agent:{agent_id}:relationships` | Hash | 人际关系 |
+| `agent:{agent_id}:capabilities` | Set | 能力（如 `web_search`），未开启即为空 |
 | `wm:{agent_id}:stm` / `wm:{agent_id}:stm:compress` | List | 工作记忆原文 / 压缩摘要（`{agent_id}` 两侧的花括号是字面量，用作 Redis Cluster 的 hash tag） |
 
 ## MongoDB

@@ -147,10 +147,10 @@ class TaskReminderWorker:
     async def _execute_and_complete(self, agent_id: str, task: dict):
         """执行任务并标记完成"""
         try:
-            result = await task_executor.execute_task(agent_id, task)
+            # run_task：执行成功后移出待办；同一任务正在执行时（如对话中刚触发了立即执行）会跳过
+            result = await task_executor.run_task(agent_id, task)
 
             if result["success"]:
-                await subjectivity_service.complete_task(agent_id, task["task_id"])
                 logger.info(f"✅ Task completed: {task['content']} → {result['result']}")
             else:
                 logger.warning(f"❌ Task failed: {task['content']}")

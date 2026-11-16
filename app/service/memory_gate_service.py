@@ -14,6 +14,7 @@ from typing import Dict, List
 
 from app.client.doubao_client import doubao_client
 from app.repository.memory_repository import memory_repository
+from app.repository.relationship_repository import PROFILE_SLOTS, relationship_repository
 from app.service.subjectivity_service import subjectivity_service
 from app.service.agent_life_event_service import agent_life_event_service
 
@@ -25,6 +26,108 @@ class MemoryGateService:
 
     def __init__(self):
         self.enabled = True
+
+    # 槽位判定规则（抽取提示词用）：写清楚"什么算、什么不算"，避免"在浦东上班"被抽成住址
+    PROFILE_SLOT_RULES = {
+        "姓名": "说话人的真实姓名（\"我叫王五\"）。称呼（老王、姐）不算",
+        "称呼": "别人怎么叫自己（\"大家都叫我老王\"）",
+        "年龄": "**说话人本人**的年龄或出生年份。家人的年龄归家庭成员",
+        "生日": "**说话人本人**的生日或出生月日",
+        "住址": "说话人住在哪里（\"我住在北京\"\"我搬到上海了\"\"我家在杭州\"）。工作地点、孩子学校都不算",
+        "籍贯": "老家、家乡、土生土长的地方",
+        "职业": "说话人做什么工作（\"我是老师\"\"我做后端\"）",
+        "单位": "在哪个公司/机构（\"我在字节跳动\"\"我在市医院上班\"）",
+        "职位": "职务级别（\"我是团队负责人\"\"我是主治医师\"）。与职称无关的工作内容不算",
+        "家庭成员": "家人及其年龄、上学、职业等信息（\"我女儿五岁\"\"我妈有高血压\"）。一人一条，把信息写在同一 value 里",
+        "健康状况": "**说话人本人**的疾病、慢性病、身体状况",
+        "过敏与禁忌": "说话人本人的过敏原、忌口、不能碰的东西（\"我对花生过敏\"\"我不吃辣\"）。一项一条",
+        "长期偏好": "说话人本人长期稳定的喜好（\"我只喝美式\"\"我喜欢下雨天\"）。一次性的选择不算",
+        "忌讳": "说话人明确不希望被做的事、不愿聊的话题",
+        "重要日期": "对说话人有意义且每年会到的日期（结婚纪念日、忌日）。一次性的日程不算",
+        "习惯": "说话人长期反复的行为（\"我每天六点起床\"\"我习惯熬夜\"）。一次性的行为不算",
+    }
+
+    # 个人信息抽取：句子 → 受控槽位里的结构化事实
+    PROFILE_EXTRACT_PROMPT = """从这句话里，抽出说话人（{speaker}）主动说出的、关于**他自己**的稳定个人信息。
+
+## 规则
+
+1. 只抽说话人本人的事。他转述别人的事（"我老板他家在……"）、问句（"我住哪你知道吗"）、
+   情绪和临时状态（"我今天很累""我快忙死了"）都不抽。
+2. 归属要分清楚：
+   - "我女儿五岁" → 家庭成员 = 女儿五岁。**不是**说话人 5 岁
+   - "我在浦东上班" → 工作地点是浦东，**不是**住址；住址只抽"住 / 搬到 / 家在"这类
+   - "我在字节做后端" → 单位 = 字节，职业 = 后端工程师
+3. value 必须是可以直接比较的最小事实，不要带"现在""我""了"这类词：
+   - "我上个月搬到上海了，现在在浦东上班" → 住址 = 上海；单位 = 浦东（若是单位）；不抽工作地点
+   - "我对花生过敏，也不能吃辣" → 过敏与禁忌 = 花生、辣（两条）
+4. 时间词（"以前住杭州""现在搬到了上海"）：只抽**当前**有效的事实；"以前""原来"那种旧状态不抽
+   （旧状态靠库里已有的记录和覆盖机制保留）。
+5. 一句话里没有可抽取的就返回空数组。宁可少抽，不要猜。
+
+## 槽位判定
+
+{slot_rules}
+
+## 输出
+
+只输出 JSON，不要任何其他文字：
+
+{{"facts": [{{"slot": "住址", "value": "上海", "text": "搬到上海了"}}]}}
+
+- slot：只能是上面列出的槽位名
+- value：最小事实，用于去重和比较
+- text：一句自然的话，用于给提示词展示
+
+句子：{signal}"""
+
+    async def _extract_person_facts(self, speaker: str, signal: str) -> Dict[str, list]:
+        """抽个人信息并校验槽位，返回 {slot: [{value, text}]}；解析失败返回空"""
+        import json as _json
+        try:
+            raw = await doubao_client.generate(
+                self.PROFILE_EXTRACT_PROMPT.format(
+                    speaker=speaker,
+                    slot_rules="\n".join(f"- {k}：{v}" for k, v in self.PROFILE_SLOT_RULES.items()),
+                    signal=signal,
+                ),
+                max_tokens=300,
+            )
+            text = (raw or "").strip()
+            if "{" in text:
+                text = text[text.index("{"): text.rindex("}") + 1]
+            facts = _json.loads(text).get("facts") or []
+        except Exception as e:
+            logger.warning(f"Person fact extraction failed for {speaker}: {e}")
+            return {}
+
+        out: Dict[str, list] = {}
+        for f in facts:
+            slot = (f.get("slot") or "").strip()
+            value = (f.get("value") or "").strip()
+            if slot in PROFILE_SLOTS and value:
+                out.setdefault(slot, []).append({"value": value, "text": (f.get("text") or value).strip()})
+        return out
+
+    async def _update_person_profile(self, agent_id: str, speaker: str, signal: str) -> None:
+        """
+        把这句话里关于说话人的个人信息融合进关系表的 profile。
+        陌生人（不在关系表里）直接忽略：路人一上来就说自己的事，人也会听着、但不会正儿八经记下来。
+        """
+        if not speaker or speaker in ("user", "self", "用户"):
+            return  # 匿名说话人不知道是谁的个人信息
+        if not await relationship_repository.get(agent_id, speaker):
+            logger.info(f"Person fact ignored for {agent_id}: '{speaker}' is not in relationships (stranger)")
+            return
+        facts = await self._extract_person_facts(speaker, signal)
+        if not facts:
+            return
+        for slot, items in facts.items():
+            try:
+                await relationship_repository.merge_profile(agent_id, speaker, slot, items)
+                logger.info(f"Profile {agent_id}/{speaker}/{slot}: merged {[i['value'] for i in items]}")
+            except Exception as e:
+                logger.error(f"Merge profile failed ({slot}): {e}", exc_info=True)
 
     async def evaluate(
         self,
@@ -72,6 +175,13 @@ class MemoryGateService:
                             "安全/健康约束（过敏/禁忌）",
                         ],
                     },
+                    "person_fact": {
+                        "type": "noul",
+                        "instructions": f"""这句话里，说话人有没有主动说出关于他自己的、稳定的个人信息？
+                                                   只看说话人本人（"我……"），不看他转述别人的事，也不看问句。
+                                                   可归入这些属性的算：{'、'.join(PROFILE_SLOTS)}
+                                                   （"我是工程师""我住在北京""我对花生过敏"算；"你住在哪""今天好累"不算）""",
+                    },
                     "memory_type": {
                         "type": "choice",
                         "instructions": "判断这条信息最适合的记忆类型。注意区分：对话/事件/经历(EPISODIC) vs 稳定的事实/属性(SEMANTIC)。",
@@ -89,6 +199,8 @@ class MemoryGateService:
             importance = round(importance_raw)  # 转为 0-4 整数
 
             memory_type = answers.get("memory_type", {}).get("choice", "SEMANTIC")
+            # 个人信息：只是"这句话里有没有"，是否需要融合由调用方决定（陌生人忽略）
+            person_fact = float(answers.get("person_fact", {}).get("noul", 0.0))
 
             # 决策逻辑
             should_save = importance > 0
@@ -102,6 +214,7 @@ class MemoryGateService:
                 "should_save": should_save,
                 "storage_recommendation": storage_recommendation,
                 "ttl": ttl,
+                "person_fact": person_fact,
                 "input_text": text,  # 用于调试
             }
 
@@ -225,9 +338,14 @@ class MemoryGateService:
 
             # 2. 分层持久化策略
             # - importance 0: 丢弃，不记录
-            # - importance 1-2: 仅 PFC (工作记忆)，不写 Episodic
-            # - importance 3-4: Episodic (情景记忆)，重要事件
-            # - SEMANTIC: Brief (核心信条)，高度抽象的事实
+            # - importance 1-2: 仅 PFC (工作记忆)，不写长期记忆
+            # - importance ≥ 3: Episodic (情景记忆)，不论判为 EPISODIC 还是 SEMANTIC
+            #
+            # 对话不直接写 Brief：Brief 是"我的信条"（对自我的判断），而对话里是"对方说的话"。
+            # 对方一句刺耳或重要的话落地时是经历，要过一段时间、经过反思才可能变成对自己的认识，
+            # 中间可能有完全不同的结论（自我怀疑、对关系的判断、对自我的认识，或者什么都没形成）。
+            # 直接铸成信条等于替 agent 决定了它该怎么被影响，而且 Brief 不衰减、不重激活、没有删除接口，
+            # 写进去就是永久的。所以这里只把"判为关于稳定事实的话"写进 Episodic，Brief 只由反思写入
 
             if importance < 1:
                 logger.debug(
@@ -237,7 +355,7 @@ class MemoryGateService:
                 return
 
             # importance 1-2: 只记录到 PFC，不写入长期记忆
-            if importance < 3 and memory_type == "EPISODIC":
+            if importance < 3:
                 logger.info(
                     f"Memory gate: signal importance={importance}, "
                     f"recorded to PFC only (not persistent)"
@@ -250,56 +368,40 @@ class MemoryGateService:
                 f"persisting to long-term memory..."
             )
 
-            # 3. 根据类型持久化到相应脑区
-            if memory_type == "EPISODIC":
-                # 🔧 将 speaker 信息嵌入到内容中，避免 Mem0 抽取时丢失
-                if speaker and speaker != "user" and speaker != "self":
-                    # Agent 间对话：标注说话人
-                    enriched_content = f"{speaker}对我说：{signal}"
-                else:
-                    # 用户对话或自言自语
-                    enriched_content = signal
+            # 3. 持久化到情景记忆（判为 SEMANTIC 的也进 Episodic，只是多标一个 gate_type 供反思参考）
+            # 🔧 将 speaker 信息嵌入到内容中，避免 Mem0 抽取时丢失
+            if speaker and speaker != "user" and speaker != "self":
+                # Agent 间对话：标注说话人
+                enriched_content = f"{speaker}对我说：{signal}"
+            else:
+                enriched_content = signal
 
-                # 持久化到情景记忆
-                await memory_repository.add(
-                    agent_id=agent_id,
-                    messages=[{"role": "user", "content": enriched_content}],
-                    memory_type="episodic",
-                    metadata={
-                        "speaker": speaker,
-                        "importance": importance,
-                        "source": "memory_gate",
-                        "timestamp": datetime.now().isoformat(),
-                    }
-                )
-                logger.info(f"Persisted to EPISODIC: {enriched_content[:50]}...")
-
-            elif memory_type == "SEMANTIC":
-                # 🔧 将 speaker 信息嵌入到内容中
-                if speaker and speaker != "user" and speaker != "self":
-                    enriched_content = f"{speaker}对我说：{signal}"
-                else:
-                    enriched_content = signal
-
-                # 持久化到语义记忆（Brief）
-                await memory_repository.add(
-                    agent_id=agent_id,
-                    messages=[{"role": "user", "content": enriched_content}],
-                    memory_type="brief",
-                    metadata={
-                        "speaker": speaker,
-                        "importance": importance,
-                        "category": "user_profile",
-                        "source": "memory_gate",
-                        "timestamp": datetime.now().isoformat(),
-                    }
-                )
-                logger.info(f"Persisted to SEMANTIC(Brief): {enriched_content[:50]}...")
+            await memory_repository.add(
+                agent_id=agent_id,
+                messages=[{"role": "user", "content": enriched_content}],
+                memory_type="episodic",
+                metadata={
+                    "speaker": speaker,
+                    "importance": importance,
+                    "gate_type": memory_type,
+                    "source": "memory_gate",
+                    "timestamp": datetime.now().isoformat(),
+                }
+            )
+            logger.info(f"Persisted to EPISODIC(gate_type={memory_type}): {enriched_content[:50]}...")
 
             # 注意：Knowledge 类型已从 Memory Gate 移除
             # 知识习得通过 initialize agent 时显式调用 knowledge_memory_service.add_knowledge()
 
-            # 4. 更新 Situation 和 Overall State（基于重要信息）
+            # 4. 个人信息：说话人本人主动说出的稳定信息，融合进关系表里这个人的 profile
+            #    （和"我住在北京"这类事实分开：那是一条经历，这是"我认识的这个人是谁"）
+            if gate_result.get("person_fact", 0.0) >= 0.6:
+                try:
+                    await self._update_person_profile(agent_id, speaker, signal)
+                except Exception as e:
+                    logger.error(f"Update person profile failed: {e}", exc_info=True)
+
+            # 5. 更新 Situation 和 Overall State（基于重要信息）
             await self._update_situation_and_state(agent_id, signal, importance, memory_type)
 
         except Exception as e:

@@ -455,6 +455,10 @@ class SubjectivityService:
             return None
 
         now = datetime.now()
+        # target_person 必须是关系表里的名字，否则无法据此主动联系对方
+        from app.repository.relationship_repository import relationship_repository
+        people = await relationship_repository.load_all(agent_id)
+        people_str = "、".join(f"{n}（{r['relationship']}）" for n, r in people.items()) or "（无）"
         prompt = f"""你是这个Agent的内心世界。
 
                     现在是 {now.strftime('%Y年%m月%d日 %H:%M')}。
@@ -467,8 +471,10 @@ class SubjectivityService:
                     - 压力：{context.overall_state.get('stress', 0.3):.2f}
                     - 精力：{context.overall_state.get('energy', 0.7):.2f}
 
+                    【我认识的人】{people_str}
+
                     此刻内心会冒出什么念头？（内心独白，20字以内）
-                    有没有想要做的事或想找的人？
+                    有没有想要做的事或想找的人？想找的人只能从【我认识的人】里选，写名字原文
 
                     输出JSON：
                     {{
@@ -621,10 +627,13 @@ class SubjectivityService:
         t_start = time.perf_counter()
         try:
             ctx = context or {}
+            # 没有联网能力的 agent（如拟人角色），漏斗里不问"要不要联网 / 要不要现在就做"，任务里两项都是 False
+            from app.repository.capability_repository import CAP_WEB_SEARCH, capability_repository
+            can_web = await capability_repository.has(agent_id, CAP_WEB_SEARCH)
             if source == "thought":
-                result = await self._thought_funnel(content, ctx)
+                result = await self._thought_funnel(content, ctx, can_web)
             elif source == "dialogue":
-                result = await self._dialogue_funnel(content, ctx)
+                result = await self._dialogue_funnel(content, ctx, can_web)
             else:
                 return None
             if not result:
@@ -659,6 +668,10 @@ class SubjectivityService:
                     "deadline": result.get("deadline"),
                     "related_person": result.get("related_person"),
                     "interaction_type": result.get("interaction_type"),
+                    # 是否需要联网搜索补充信息：由漏斗里的决策模型判断，执行阶段据此走联网搜索
+                    "needs_web_search": bool(result.get("needs_web_search")),
+                    # 对话中判断为"现在就该做"：写入后由调用方立即执行（只限有真实执行能力的任务，见 task_executor）
+                    "execute_now": bool(result.get("execute_now")),
                     "created_at": datetime.now().isoformat(),
                     "status": "pending",
                 }
@@ -788,81 +801,129 @@ class SubjectivityService:
         """对外展示/写事件用的任务字段（去掉内部的向量）"""
         return {k: v for k, v in task.items() if k != "vector"}
 
-    async def _thought_funnel(self, content: str, ctx: Dict) -> Optional[Dict]:
-        """Thought 3层: 关键词 → decide → LLM"""
-        keywords = ["得","要","应该","需要","必须","找","联系","问","谈","说","做","写","改","查","看","准备","安排","计划","约"]
-        if any(k in content for k in keywords):
-            logger.info(f"Thought L1(kw): {content[:20]}")
-            return {"content": content, "priority": 0.6, "related_person": self._extract_person(content)}
+    # 是否需要联网：和漏斗里已有的问题放在同一次 System One 请求里，不额外增加调用
+    NEEDS_WEB_SEARCH_QUESTION = {
+        "type": "choice",
+        "instructions": "完成这件事，是否需要上网搜索、查资料来获取我现在还不知道的信息？",
+        "criteria": {
+            "yes": "需要查询、了解、研究、核实某个知识或事实，或需要最新的信息（新闻、价格、政策、研究进展等）",
+            "no": "做事、联系人、提醒、整理已有的东西，或凭已知的就能完成",
+        },
+    }
 
-        # decide
+    @staticmethod
+    def _yes_prob(answers: Dict, key: str) -> float:
+        """
+        System One 选择题里"yes"的概率。注意不能用返回的 confidence：它表示判断有多确定（约为 1 - 熵），
+        不是"yes 的概率"。例如 yes 概率 0.755 时 confidence 只有 0.197
+        """
+        a = answers.get(key, {})
+        probs = a.get("probabilities") or {}
+        if "yes" in probs:
+            return float(probs["yes"])
+        return 1.0 if a.get("choice") == "yes" else 0.0
+
+    @staticmethod
+    def _needs_web_search(answers: Dict) -> bool:
+        return answers.get("needs_web_search", {}).get("choice", "no") == "yes"
+
+    async def _thought_funnel(self, content: str, ctx: Dict, can_web: bool = False) -> Optional[Dict]:
+        """
+        念头 → 待办：一次 System One 请求同时判断"是否转待办"和"是否需要联网"（只在有联网能力时问）。
+        yes 概率 ≥ 0.8 直接创建；0.6–0.8 再交给 LLM 确认；更低不创建。
+
+        原来的第一层是关键词匹配（得、要、说、做、看……），单字关键词几乎匹配所有念头，
+        命中就直接创建、不经过决策，是待办重复的主要来源，已去掉
+        """
+        questions = {
+            "need_task": {
+                "type": "choice",
+                "instructions": "这个念头是否需要转为待办任务？",
+                "criteria": {
+                    "yes": "有想去做的具体事情：找某人、提醒某人、做某件事，或者想去了解、查明、补充某个具体的知识或信息",
+                    "no": "纯情绪、感慨、抽象担忧、对已经发生的事的回味，没有要去做的事"
+                }
+            },
+        }
+        if can_web:
+            questions["needs_web_search"] = self.NEEDS_WEB_SEARCH_QUESTION
         decide_result = await doubao_client.decide(
             state=f"念头内容：{content}\n强度：{ctx.get('intensity', 0.5):.2f}",
-            questions={
-                "need_task": {
-                    "type": "choice",
-                    "instructions": "这个念头是否需要转为待办任务？",
-                    "criteria": {
-                        "yes": "包含明确行动意图，指向具体的人或事",
-                        "no": "纯情绪、抽象担忧、无明确行动"
-                    }
-                }
-            }
+            questions=questions,
         )
-        choice = decide_result.get("answers", {}).get("need_task", {}).get("choice", "no")
-        confidence = decide_result.get("answers", {}).get("need_task", {}).get("confidence", 0.0)
+        answers = decide_result.get("answers", {})
+        p_yes = self._yes_prob(answers, "need_task")
+        needs_web = self._needs_web_search(answers)
 
-        if choice == "yes":
-            if confidence > 0.7:
-                logger.info(f"Thought L2(decide={confidence:.2f}): {content[:20]}")
-                return {"content": content, "priority": confidence}
-            elif confidence > 0.5:
-                logger.info(f"Thought L3(LLM, decide={confidence:.2f}): {content[:20]}")
-                llm = await self._llm_judge_thought(content, ctx)
-                if llm.get("should_add"):
-                    return {"content": llm.get("task_content") or content, "priority": llm.get("priority",0.6), "related_person": llm.get("related_person")}
+        if p_yes >= 0.8:
+            logger.info(f"Thought L1(p_yes={p_yes:.2f}, web={needs_web}): {content[:20]}")
+            return {"content": content, "priority": round(p_yes, 2), "needs_web_search": needs_web,
+                    "related_person": self._extract_person(content)}
+        if p_yes >= 0.6:
+            logger.info(f"Thought L2(LLM, p_yes={p_yes:.2f}, web={needs_web}): {content[:20]}")
+            llm = await self._llm_judge_thought(content, ctx)
+            if llm.get("should_add"):
+                return {"content": llm.get("task_content") or content, "priority": llm.get("priority", 0.6),
+                        "related_person": llm.get("related_person"), "needs_web_search": needs_web}
         logger.debug(f"Thought reject: {content[:20]}")
         return None
 
-    async def _dialogue_funnel(self, content: str, ctx: Dict) -> Optional[Dict]:
+    async def _dialogue_funnel(self, content: str, ctx: Dict, can_web: bool = False) -> Optional[Dict]:
         """
         对话待办 2 层：System One 粗判是否有承诺 → 置信度 > 0.5 时交给 lite 模型
         再确认一次是否有任务、把原话提炼成任务描述、按语义推出截止日期
+
+        needs_web_search / execute_now 只在有联网能力时问：目前能立即执行的只有联网任务，
+        没有联网能力时两项都没有意义，答案里没有这两项，解析结果即为 False
         """
         signal, response, speaker = ctx.get("signal", content), ctx.get("response", ""), ctx.get("speaker", "用户")
+        history = ctx.get("recent_dialogue", "")
 
-        decide_result = await doubao_client.decide(
-            state=f"{speaker}：{signal} Agent：{response}",
-            questions={
-                "has_commitment": {
-                    "type": "choice",
-                    "instructions": "Agent是否承诺了需要后续完成的待办任务？",
-                    "criteria": {
-                        "yes": "说话人明确请求Agent完成某个行动（做、汇报、提交、联系等） 且 Agent明确承诺（好的/我会/可以/记住了）",
-                        "no": "闲聊、询问情况、让对方继续说话、Agent拒绝、已完成的事、无明确承诺、纯粹的说明请求"
-                    }
-                },
-                "needs_interaction": {
-                    "type": "choice",
-                    "instructions": "任务是否需要主动联系/找某人沟通？",
-                    "criteria": {
-                        "yes": "需要找人说话、联系某人、通知某人、跟某人沟通、汇报给某人、向某人反馈、告诉某人、回复某人",
-                        "no": "自己能完成、不涉及联系他人、已经完成的对话"
-                    }
+        questions = {
+            "has_commitment": {
+                "type": "choice",
+                "instructions": "Agent是否承诺了需要后续完成的待办任务？",
+                "criteria": {
+                    "yes": "说话人明确请求Agent完成某个行动（做、汇报、提交、联系等） 且 Agent明确承诺（好的/我会/可以/记住了）",
+                    "no": "闲聊、询问情况、让对方继续说话、Agent拒绝、已完成的事、无明确承诺、纯粹的说明请求"
                 }
+            },
+            "needs_interaction": {
+                "type": "choice",
+                "instructions": "任务是否需要主动联系/找某人沟通？",
+                "criteria": {
+                    "yes": "需要找人说话、联系某人、通知某人、跟某人沟通、汇报给某人、向某人反馈、告诉某人、回复某人",
+                    "no": "自己能完成、不涉及联系他人、已经完成的对话"
+                }
+            },
+        }
+        if can_web:
+            questions["needs_web_search"] = self.NEEDS_WEB_SEARCH_QUESTION
+            questions["execute_now"] = {
+                "type": "choice",
+                "instructions": "这件事是不是现在就该马上着手去做？",
+                "criteria": {
+                    "yes": "对方要求现在、马上去做；或者没提时间，而且是立刻就能动手的事（如查资料、核实信息、搜索）",
+                    "no": "指定了以后的时间（今晚、明天、下周、某个日期之前），或者要等某个条件满足，或者是到时候的提醒",
+                },
             }
+        decide_result = await doubao_client.decide(
+            state=(f"刚才的对话：\n{history}\n\n此刻：" if history else "") + f"{speaker}：{signal} Agent：{response}",
+            questions=questions,
         )
         answers = decide_result.get("answers", {})
-        choice = answers.get("has_commitment", {}).get("choice", "no")
-        confidence = answers.get("has_commitment", {}).get("confidence", 0.0)
+        # 用 yes 概率而不是 confidence（见 _yes_prob）。原来的 confidence > 0.5 约等于 yes 概率 ≥ 0.89，这里保持同样严格
+        p_commit = self._yes_prob(answers, "has_commitment")
         needs_interaction = answers.get("needs_interaction", {}).get("choice", "no")
-        logger.info(f"🔍 Dialogue funnel: has_commitment={choice}({confidence:.2f}), "
-                    f"needs_interaction={needs_interaction}, signal={signal[:30]}")
+        needs_web = self._needs_web_search(answers)
+        execute_now = answers.get("execute_now", {}).get("choice", "no") == "yes"
+        logger.info(f"🔍 Dialogue funnel: p_commit={p_commit:.2f}, needs_interaction={needs_interaction}, "
+                    f"needs_web_search={needs_web}, execute_now={execute_now}, signal={signal[:30]}")
 
-        if choice != "yes" or confidence <= 0.5:
+        if p_commit < 0.85:
             return None
 
-        extracted = await self._llm_extract_dialogue_task(signal, response, speaker)
+        extracted = await self._llm_extract_dialogue_task(signal, response, speaker, history)
         if not extracted:
             logger.info(f"Dialogue funnel: LLM found no task, signal={signal[:30]}")
             return None
@@ -872,30 +933,38 @@ class SubjectivityService:
             "priority": 0.8,
             "deadline": extracted["deadline"],
             "related_person": speaker,
+            "needs_web_search": needs_web,
+            "execute_now": execute_now,
         }
         if needs_interaction == "yes":
             task["interaction_type"] = "dialogue"
-        logger.info(f"Dialogue task (decide={confidence:.2f}): {task['content']} deadline={task['deadline']}")
+        logger.info(f"Dialogue task (p_commit={p_commit:.2f}): {task['content']} deadline={task['deadline']}")
         return task
 
     # 提示词尽量短、输出只有一两行纯文本（不用 JSON），减少输入和输出 token
+    # 只提炼，不再判断"有没有任务"：System One 已判断有承诺（yes 概率 ≥ 0.85）。
+    # 实测让 lite 再确认一次反而不稳：同一输入、温度 0，约 1/4 的概率回答"无"，导致明确的承诺被漏掉
     DIALOGUE_TASK_PROMPT = """今天是{today}（{weekday}）。
+刚才的对话：
+{history}
+
+此刻：
 {speaker}：{signal}
 我：{response}
 
-我答应了要去做某件事吗？没有就只输出：无
-有就输出两行，不加任何前缀：
-任务描述（不照抄原话，写清做什么，30字内）
+我答应了要去做一件事。输出两行，不加任何前缀：
+任务描述（不照抄原话，写清做什么；这句话省略了要做的事时，从刚才的对话里补全具体对象，30字内）
 截止日期 YYYY-MM-DD（按话里的时间推算；没提时间写：无）"""
 
     WEEKDAYS = "一二三四五六日"
 
-    async def _llm_extract_dialogue_task(self, signal: str, response: str, speaker: str) -> Optional[Dict]:
-        """lite 模型确认任务、提炼描述、推算截止日期。没有任务或调用失败返回 None"""
+    async def _llm_extract_dialogue_task(self, signal: str, response: str, speaker: str, history: str = "") -> Optional[Dict]:
+        """lite 模型提炼任务描述、推算截止日期。调用失败或输出为空时返回 None"""
         today = datetime.now()
         prompt = self.DIALOGUE_TASK_PROMPT.format(
             today=today.strftime("%Y-%m-%d"), weekday=f"星期{self.WEEKDAYS[today.weekday()]}",
             speaker=speaker, signal=signal, response=response or "（没有回应）",
+            history=history or "（无）",
         )
         try:
             resp = await doubao_client.chat(
@@ -911,6 +980,8 @@ class SubjectivityService:
         lines = [prefix.sub("", l).strip() for l in (resp or "").strip().splitlines() if l.strip()]
         if not lines or lines[0].rstrip("。.") in ("无", "没有"):
             return None
+        # 偶尔会把日期写在描述开头（"2026-11-15提醒……"），去掉
+        lines[0] = re.sub(r"^\d{4}-\d{2}-\d{2}\s*", "", lines[0]).strip()
 
         deadline = None
         if len(lines) > 1:
